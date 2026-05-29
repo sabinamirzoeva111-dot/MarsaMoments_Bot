@@ -340,7 +340,7 @@ def check_report(report_text: str, chat_id: int) -> str:
         return verdict
     except Exception as e:
         logger.exception("Ошибка при запросе к Claude")
-        return f"⚠️ Не смогла проверить отчёт (техническая ошибка): {e}"
+        return f"⚠️ Не смог проверить отчёт (техническая ошибка): {e}"
 
 
 # ──────────────────────────────────────────────
@@ -444,8 +444,8 @@ async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     lines = ["📍 Где я нахожусь:"]
     lines.append(f"• Group: {chat.title or '(без названия)'}")
-    lines.append(f"• Распознала точку: **{location or 'не распознала'}**")
-    lines.append(f"• Распознала тему: **{topic_type or 'не распознала (или основной чат)'}**")
+    lines.append(f"• Распознал точку: **{location or 'не распознал'}**")
+    lines.append(f"• Распознал тему: **{topic_type or 'не распознал (или основной чат)'}**")
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -555,12 +555,16 @@ def recognize_place(update: Update) -> tuple[str | None, str | None]:
     R_LOCATION,
     R_REVENUE,
     R_TIP,
+    R_CASH_HOLDING,
     R_PHOTOGRAPHERS,
     R_SALES_BREAKDOWN,
     R_PHOTOSHOOT_SETS,
+    R_EXPENSES,
+    R_DEFECTIVE,
+    R_REMAINING,
     R_LINKS,
     R_CONFIRM,
-) = range(8)
+) = range(12)
 
 
 def get_employee_info(username: str | None) -> dict | None:
@@ -638,25 +642,73 @@ def format_final_report(data: dict) -> str:
     lines.append(f"Card: {data['card']} AED")
     lines.append(f"Cash: {data['cash']} AED")
     if data.get("tip"):
-        tip = data["tip"]
-        # Tip может быть числом или строкой "100 Polina"
-        lines.append(f"Tip: {tip}")
+        lines.append(f"Tip: {data['tip']}")
     lines.append("")
 
-    # Individual Sales
+    # Cash Holding
+    if data.get("cash_holding"):
+        lines.append("💵 Cash Holding:")
+        # cash_holding может быть в виде "Anas 200, Mahir 100"
+        holders = [h.strip() for h in re.split(r"[,;\n]", data["cash_holding"]) if h.strip()]
+        for h in holders:
+            m = re.match(r"^(.+?)\s+(\d+)$", h)
+            if m:
+                lines.append(f"Cash With {m.group(1).strip()}: {m.group(2)} AED")
+            else:
+                lines.append(f"Cash With {h}")
+        lines.append("")
+
     photographers = data.get("photographers", [])
-    if photographers:
+
+    # Individual Sales — только если 2+ фотографа
+    if len(photographers) >= 2:
         lines.append("👥 Individual Sales:")
         for p in photographers:
             lines.append(f"Photographer {p['name']}: {p['sales']} AED")
         lines.append("")
 
-    # Salaries — авторасчёт
+    # Salaries — авторасчёт (всегда если есть фотографы)
     salaried = [p for p in photographers if p.get("salary") is not None]
     if salaried:
         lines.append("💼 Salaries:")
         for p in salaried:
             lines.append(f"Photographer {p['name']}: {p['salary']} AED")
+        lines.append("")
+
+    # Expenses (Taxi)
+    if data.get("expenses"):
+        lines.append("💸 Expenses:")
+        # ожидаем формат "photographer 50, retoucher 40"
+        parts = [p.strip() for p in re.split(r"[,;\n]", data["expenses"]) if p.strip()]
+        for part in parts:
+            m = re.match(r"^(photographer|retoucher)\s+(\d+)$", part.lower())
+            if m:
+                role = "Photographer" if m.group(1) == "photographer" else "Retoucher"
+                lines.append(f"• {role} Taxi: {m.group(2)} AED")
+            else:
+                lines.append(f"• {part}")
+        lines.append("")
+
+    # Defective Materials
+    if data.get("defective"):
+        d = data["defective"]
+        lines.append("🧾 Defective Materials:")
+        lines.append(f"• A4 Prints: {d['prints']} pcs")
+        lines.append(f"• A4 Envelopes: {d['envelopes']} pcs")
+        lines.append(f"• A4 Frames: {d['frames']} pcs")
+        lines.append(f"• A4 Bags: {d['bags']} pcs")
+        lines.append("")
+
+    # Remaining Consumables
+    if data.get("remaining"):
+        r = data["remaining"]
+        lines.append("📦 Remaining Consumables:")
+        lines.append(f"• A4 Paper: {r['paper']} pcs")
+        lines.append(f"• A4 Envelopes: {r['envelopes']} pcs")
+        lines.append(f"• A4 Frame: {r['frame']} pcs")
+        lines.append(f"• A4 Black Bags: {r['black_bags']} pcs")
+        lines.append(f"• Business Cards: {r['business_cards']} pcs")
+        lines.append(f"• Business Card Envelopes: {r['bc_envelopes']} pcs")
         lines.append("")
 
     # Sales Breakdown
@@ -680,7 +732,7 @@ def format_final_report(data: dict) -> str:
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Старт диалога /report — только в личке."""
+    """Старт диалога /report — только в личке, только для авторизованных."""
     chat = update.effective_chat
     if not chat or chat.type != "private":
         await update.effective_message.reply_text(
@@ -690,8 +742,18 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     user = update.effective_user
     emp = get_employee_info(user.username if user else None)
-    name = emp["name"] if emp else (user.first_name if user else "сотрудник")
 
+    # Приватность: только сотрудники из EMPLOYEES имеют доступ
+    if not emp:
+        if user:
+            log_unauthorized_access(user)
+        await update.effective_message.reply_text(
+            "У тебя нет доступа к этой команде.\n"
+            "Если ты в команде Marsa Moments — обратись к Сабине, чтобы она тебя добавила."
+        )
+        return ConversationHandler.END
+
+    name = emp["name"]
     context.user_data["report"] = {
         "name": name,
         "username": user.username if user else None,
@@ -706,7 +768,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="loc::cancel")])
 
     await update.effective_message.reply_text(
-        f"Привет, {name}! Закрываем смену 📋\nКакая точка?",
+        f"{name}, привет! 🌙 Закрываем смену.\nНа какой точке сегодня была?",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return R_LOCATION
@@ -718,7 +780,7 @@ async def on_location_picked(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     data = query.data
     if data == "loc::cancel":
-        await query.edit_message_text("Отменено. Когда будешь готова — /report ещё раз.")
+        await query.edit_message_text("Окей, отбой. Когда будешь готов(а) — /report ещё раз 👌")
         return ConversationHandler.END
 
     location = data.split("::", 1)[1]
@@ -726,7 +788,7 @@ async def on_location_picked(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await query.edit_message_text(
         f"📍 Точка: *{location}*\n\n"
-        f"Дальше — выручка одной строкой в формате:\n"
+        f"Кидай выручку одной строкой:\n"
         f"`Total Card Cash`\n\n"
         f"Например: `2300 2000 300`",
         parse_mode="Markdown",
@@ -740,8 +802,9 @@ async def on_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     parsed = parse_revenue_line(text)
     if not parsed:
         await update.effective_message.reply_text(
-            "Не разобрала. Нужно три числа: Total, Card, Cash. И Card + Cash должно = Total.\n"
-            "Пример: `2300 2000 300`",
+            "Ты что-то пишешь неверно, проверь точно правильность суммы 🙏\n"
+            "Мне нужна общая сумма, потом сколько оплатили картой, потом наличными.\n\n"
+            "Пример: `2300 2000 300` (Total 2300 = Card 2000 + Cash 300)",
             parse_mode="Markdown",
         )
         return R_REVENUE
@@ -752,24 +815,48 @@ async def on_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["report"]["cash"] = cash
 
     await update.effective_message.reply_text(
-        f"✅ Total {total}, Card {card}, Cash {cash}\n\n"
-        f"💸 Чаевые? Если нет — /skip\n"
-        f"Если есть — напиши сумму и кому (например: `100 Polina`)"
+        f"Записал ✍️ Касса {total} / Card {card} / Cash {cash}\n\n"
+        f"💸 Чаевые были? Кидай сумму и кому (например: `100 Polina`).\n"
+        f"Если нет — /skip"
     )
     return R_TIP
 
 
 async def on_tip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Чаевые — опциональные."""
+    """Чаевые — опциональные. Дальше Cash Holding если cash > 0."""
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
         context.user_data["report"]["tip"] = text
 
+    cash = context.user_data["report"].get("cash", 0)
+    if cash > 0:
+        await update.effective_message.reply_text(
+            f"💵 У кого остались наличные ({cash} AED) и сколько?\n"
+            f"Формат: `Anas 200, Mahir 100`\n"
+            f"Если всё в одних руках — `Anas {cash}`",
+            parse_mode="Markdown",
+        )
+        return R_CASH_HOLDING
+
+    # Наличных нет — пропускаем Cash Holding
+    return await ask_photographers(update, context)
+
+
+async def on_cash_holding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cash Holding — у кого наличные."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["report"]["cash_holding"] = text
+    return await ask_photographers(update, context)
+
+
+async def ask_photographers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Спросить кто работал и сколько каждый сделал."""
     await update.effective_message.reply_text(
-        "👥 Фотографы на смене и их продажи?\n"
+        "👥 Кто работал и сколько каждый сделал?\n"
         "Формат: `Имя сумма, Имя сумма`\n\n"
         "Например: `Jennet 1500, Polina Kostyn 800`\n\n"
-        "(Зарплаты я посчитаю сама — по ставкам из базы.)",
+        "Зарплаты сам посчитаю по ставкам из базы 💼",
         parse_mode="Markdown",
     )
     return R_PHOTOGRAPHERS
@@ -781,7 +868,7 @@ async def on_photographers(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     parsed = parse_photographers_line(text)
     if not parsed:
         await update.effective_message.reply_text(
-            "Не разобрала. Формат: `Имя сумма, Имя сумма`\n"
+            "Не понял. Формат: `Имя сумма, Имя сумма`\n"
             "Пример: `Jennet 1500, Polina Kostyn 800`",
             parse_mode="Markdown",
         )
@@ -805,13 +892,13 @@ async def on_photographers(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if p.get("salary") is not None:
             salary_lines.append(f"  • {p['name']}: {p['salary']} AED ({int(p['rate']*100)}%)")
         else:
-            salary_lines.append(f"  • {p['name']}: ставка не найдена, зарплату посчитай вручную")
+            salary_lines.append(f"  • {p['name']}: ставка не нашёл, посчитай зарплату вручную")
 
     salaries_block = "\n".join(salary_lines)
 
     await update.effective_message.reply_text(
-        f"✅ Зарплаты посчитала:\n{salaries_block}\n\n"
-        f"🧾 Теперь Sales Breakdown — пришли одним сообщением все строки как обычно:\n\n"
+        f"Окей, зарплаты разложил 💼\n{salaries_block}\n\n"
+        f"🧾 Теперь кидай Sales Breakdown одним сообщением — как обычно постишь:\n\n"
         f"Например:\n"
         f"1. 300 AED 💳 — 1 Frame, 1 Bag, 1 Business Card with Envelope — +971... — Имя гостя\n"
         f"2. 500 AED 💵 — 2 w/f, 2 Envelope, 2 Business Card with Envelope — +971... — Имя\n\n"
@@ -826,9 +913,10 @@ async def on_sales_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if text and text != "/skip":
         context.user_data["report"]["sales_breakdown"] = text
 
+    # TODO(автосбор): сеты должны браться из chat events, а не от пользователя.
+    # Когда сделаем — этот шаг убрать, сразу спрашивать Expenses.
     await update.effective_message.reply_text(
-        "📸 Photoshoot Sets — пришли одним сообщением.\n\n"
-        "Например:\n"
+        "📸 Сеты как обычно одним сообщением:\n"
         "Set 1: 11\n"
         "Set 2: 8\n"
         "Set 3: 12\n\n"
@@ -838,14 +926,90 @@ async def on_sales_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def on_photoshoot_sets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сеты свободным текстом."""
+    """Сеты свободным текстом. Дальше — Expenses (такси)."""
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
         context.user_data["report"]["photoshoot_sets"] = text
 
     await update.effective_message.reply_text(
-        "🔗 Ссылки Pixieset / Google Drive?\n"
-        "Пришли одним сообщением. Или /skip."
+        "💸 Такси — было?\n"
+        "Формат: `photographer 50, retoucher 40` (любое из двух можно пропустить)\n"
+        "Если такси не было совсем — /skip",
+        parse_mode="Markdown",
+    )
+    return R_EXPENSES
+
+
+async def on_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Расходы на такси."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["report"]["expenses"] = text
+
+    await update.effective_message.reply_text(
+        "🧾 Defective Materials — что забраковали?\n"
+        "Одной строкой 4 числа в порядке: `Prints, Envelopes, Frames, Bags`\n"
+        "Например: `58, 0, 1, 0`\n\n"
+        "Если ничего не забраковали — /skip"
+    )
+    return R_DEFECTIVE
+
+
+async def on_defective(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Defective Materials — 4 числа одной строкой."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        nums = [n.strip() for n in re.split(r"[,;\s]+", text) if n.strip()]
+        if len(nums) != 4 or not all(n.isdigit() for n in nums):
+            await update.effective_message.reply_text(
+                "Не понял. Нужно 4 числа через запятую или пробел.\n"
+                "Порядок: `Prints, Envelopes, Frames, Bags`\n"
+                "Пример: `58, 0, 1, 0`\n\n"
+                "Или /skip"
+            )
+            return R_DEFECTIVE
+        context.user_data["report"]["defective"] = {
+            "prints": int(nums[0]),
+            "envelopes": int(nums[1]),
+            "frames": int(nums[2]),
+            "bags": int(nums[3]),
+        }
+
+    await update.effective_message.reply_text(
+        "📦 Remaining Consumables — сколько осталось?\n"
+        "Одной строкой 6 чисел в порядке:\n"
+        "`Paper, Envelopes, Frame, Black Bags, Business Cards, BC Envelopes`\n\n"
+        "Например: `4770, 280, 19, 54, 83, 764`\n\n"
+        "Если не считали — /skip"
+    )
+    return R_REMAINING
+
+
+async def on_remaining(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Remaining Consumables — 6 чисел одной строкой."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        nums = [n.strip() for n in re.split(r"[,;\s]+", text) if n.strip()]
+        if len(nums) != 6 or not all(n.isdigit() for n in nums):
+            await update.effective_message.reply_text(
+                "Не понял. Нужно 6 чисел через запятую или пробел.\n"
+                "Порядок: `Paper, Envelopes, Frame, Black Bags, Business Cards, BC Envelopes`\n"
+                "Пример: `4770, 280, 19, 54, 83, 764`\n\n"
+                "Или /skip"
+            )
+            return R_REMAINING
+        context.user_data["report"]["remaining"] = {
+            "paper": int(nums[0]),
+            "envelopes": int(nums[1]),
+            "frame": int(nums[2]),
+            "black_bags": int(nums[3]),
+            "business_cards": int(nums[4]),
+            "bc_envelopes": int(nums[5]),
+        }
+
+    await update.effective_message.reply_text(
+        "🔗 Кидай ссылки на отснятое — Pixieset / Drive (одним сообщением).\n"
+        "Если их нет — /skip"
     )
     return R_LINKS
 
@@ -866,9 +1030,9 @@ async def on_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         publish_hint = f"✅ Опубликую в Cash Report *{data['location']}*."
     else:
         publish_hint = (
-            f"⚠️ Я пока не знаю где Cash Report *{data['location']}* — "
+            f"⚠️ Пока не знаю где Cash Report *{data['location']}* — "
             f"пусть менеджер один раз зайдёт в эту тему и напишет `/whereami`. "
-            f"Сейчас я просто верну тебе готовый текст, скопируешь сама."
+            f"Сейчас просто верну текст, скопируешь сам(а)."
         )
 
     keyboard = [
@@ -877,7 +1041,7 @@ async def on_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
 
     await update.effective_message.reply_text(
-        f"Готовый отчёт:\n\n"
+        f"Готово, вот отчёт:\n\n"
         f"```\n{draft}\n```\n\n"
         f"{publish_hint}",
         parse_mode="Markdown",
@@ -893,7 +1057,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     choice = query.data
 
     if choice == "pub::no":
-        await query.edit_message_text("Отменено. Когда будешь готова — /report ещё раз.")
+        await query.edit_message_text("Окей, отбой. Когда будешь готов(а) — /report ещё раз 👌")
         context.user_data.pop("report", None)
         return ConversationHandler.END
 
@@ -910,18 +1074,18 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 message_thread_id=target.get("thread_id"),
             )
             await query.edit_message_text(
-                f"✅ Опубликовала в Cash Report {data['location']}. Хорошей ночи!"
+                f"Готово! Опубликовал в Cash Report {data['location']}. Хорошей ночи 🌙"
             )
         except Exception as e:
-            logger.exception("Не смогла опубликовать отчёт")
+            logger.exception("Не смог опубликовать отчёт")
             await query.edit_message_text(
-                f"⚠️ Не получилось опубликовать ({e}).\n\nВот текст, скопируй сама:\n\n"
+                f"⚠️ Не получилось опубликовать ({e}).\n\nВот текст, скопируй сам(а):\n\n"
                 f"```\n{final_text}\n```",
                 parse_mode="Markdown",
             )
     else:
         await query.edit_message_text(
-            f"Я пока не знаю Cash Report {data['location']}. Скопируй текст и постни сама:\n\n"
+            f"Пока не знаю Cash Report {data['location']}. Скопируй текст и постни сам(а):\n\n"
             f"```\n{final_text}\n```",
             parse_mode="Markdown",
         )
@@ -935,6 +1099,61 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("report", None)
     await update.effective_message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Приветствие в личке с ботом — только для своих."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+
+    if chat.type != "private":
+        return
+
+    emp = get_employee_info(user.username)
+    name = emp["name"] if emp else (user.first_name or "там")
+
+    if emp:
+        await update.effective_message.reply_text(
+            f"Привет, {name}! ✨\n"
+            f"На связи Марса — твой помощник по отчётам.\n"
+            f"Ну что, разгребаем смены? 💪\n\n"
+            f"/report — собрать End of Shift пошагово\n"
+            f"/cancel — отменить если что"
+        )
+    else:
+        # Логируем попытку доступа
+        log_unauthorized_access(user)
+        await update.effective_message.reply_text(
+            f"Привет, {name}. У тебя пока нет доступа к этому боту.\n"
+            f"Если ты в команде Marsa Moments — обратись к Сабине, чтобы она тебя добавила."
+        )
+
+
+def log_unauthorized_access(user) -> None:
+    """Записываем попытку доступа от неавторизованного пользователя."""
+    try:
+        path = Path("unauthorized_access.json")
+        log = []
+        if path.exists():
+            try:
+                log = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                log = []
+        entry = {
+            "ts": dt.datetime.now().isoformat(timespec="seconds"),
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+        }
+        log.append(entry)
+        # храним только последние 200 записей
+        log = log[-200:]
+        path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Не смог записать unauthorized_access.json")
 
 
 # ──────────────────────────────────────────────
@@ -955,9 +1174,13 @@ def main() -> None:
             R_LOCATION: [CallbackQueryHandler(on_location_picked, pattern=r"^loc::")],
             R_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_revenue)],
             R_TIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_tip), CommandHandler("skip", on_tip)],
+            R_CASH_HOLDING: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_cash_holding), CommandHandler("skip", on_cash_holding)],
             R_PHOTOGRAPHERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_photographers)],
             R_SALES_BREAKDOWN: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sales_breakdown), CommandHandler("skip", on_sales_breakdown)],
             R_PHOTOSHOOT_SETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_photoshoot_sets), CommandHandler("skip", on_photoshoot_sets)],
+            R_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_expenses), CommandHandler("skip", on_expenses)],
+            R_DEFECTIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_defective), CommandHandler("skip", on_defective)],
+            R_REMAINING: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_remaining), CommandHandler("skip", on_remaining)],
             R_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_links), CommandHandler("skip", on_links)],
             R_CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^pub::")],
         },
@@ -966,6 +1189,7 @@ def main() -> None:
     )
     app.add_handler(report_conv)
 
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whereami", cmd_whereami))
     app.add_handler(CommandHandler("locations", cmd_locations))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
