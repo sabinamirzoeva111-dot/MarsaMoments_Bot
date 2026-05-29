@@ -760,33 +760,32 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "date": dt.date.today(),
     }
 
-    locations = list(LOCATION_KEYWORDS.keys())  # Avenue, O Lounge, Chayka, Molodost, Del Mar
-    keyboard = [
-        [InlineKeyboardButton(loc, callback_data=f"loc::{loc}")]
-        for loc in locations
-    ]
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="loc::cancel")])
-
     await update.effective_message.reply_text(
-        f"{name}, привет! 🌙 Закрываем смену.\nНа какой точке сегодня была?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"{name}, привет! 🌙 Закрываем смену.\n"
+        f"На какой точке сегодня была? Напиши название (например: Avenue).\n\n"
+        f"Если передумала — /cancel"
     )
     return R_LOCATION
 
 
-async def on_location_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка кнопки выбора точки."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "loc::cancel":
-        await query.edit_message_text("Окей, отбой. Когда будешь готов(а) — /report ещё раз 👌")
-        return ConversationHandler.END
+async def on_location_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка текстового ввода точки."""
+    text = (update.effective_message.text or "").strip()
 
-    location = data.split("::", 1)[1]
+    # Используем существующий распознаватель из knowledge.py
+    location = detect_location(text)
+
+    if not location:
+        await update.effective_message.reply_text(
+            "Не понял точку. Напиши одно из названий, которые ты сама используешь "
+            "в чатах (например: Avenue, или O Lounge, или Chayka...).\n\n"
+            "Если передумала — /cancel"
+        )
+        return R_LOCATION
+
     context.user_data["report"]["location"] = location
 
-    await query.edit_message_text(
+    await update.effective_message.reply_text(
         f"📍 Точка: *{location}*\n\n"
         f"Кидай выручку одной строкой:\n"
         f"`Total Card Cash`\n\n"
@@ -1015,7 +1014,7 @@ async def on_remaining(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def on_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ссылки."""
+    """Ссылки. Дальше показываем черновик и просим подтвердить текстом."""
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
         context.user_data["report"]["links"] = text
@@ -1032,34 +1031,35 @@ async def on_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         publish_hint = (
             f"⚠️ Пока не знаю где Cash Report *{data['location']}* — "
             f"пусть менеджер один раз зайдёт в эту тему и напишет `/whereami`. "
-            f"Сейчас просто верну текст, скопируешь сам(а)."
+            f"Сейчас просто верну текст, скопируешь сама."
         )
-
-    keyboard = [
-        [InlineKeyboardButton("✅ Опубликовать", callback_data="pub::yes")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="pub::no")],
-    ]
 
     await update.effective_message.reply_text(
         f"Готово, вот отчёт:\n\n"
         f"```\n{draft}\n```\n\n"
-        f"{publish_hint}",
+        f"{publish_hint}\n\n"
+        f"Публиковать? Напиши `да` чтобы опубликовать или `нет` чтобы отменить.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return R_CONFIRM
 
 
 async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Подтверждение публикации."""
-    query = update.callback_query
-    await query.answer()
-    choice = query.data
+    """Подтверждение публикации — текстом 'да' или 'нет'."""
+    text = (update.effective_message.text or "").strip().lower()
 
-    if choice == "pub::no":
-        await query.edit_message_text("Окей, отбой. Когда будешь готов(а) — /report ещё раз 👌")
+    if text in ("нет", "no", "n", "отмена", "cancel"):
+        await update.effective_message.reply_text(
+            "Окей, отбой. Когда будешь готов(а) — /report ещё раз 👌"
+        )
         context.user_data.pop("report", None)
         return ConversationHandler.END
+
+    if text not in ("да", "yes", "y", "+", "ок", "ok", "опубликовать"):
+        await update.effective_message.reply_text(
+            "Напиши `да` или `нет`."
+        )
+        return R_CONFIRM
 
     # Публикуем
     data = context.user_data["report"]
@@ -1073,18 +1073,18 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 text=final_text,
                 message_thread_id=target.get("thread_id"),
             )
-            await query.edit_message_text(
+            await update.effective_message.reply_text(
                 f"Готово! Опубликовал в Cash Report {data['location']}. Хорошей ночи 🌙"
             )
         except Exception as e:
             logger.exception("Не смог опубликовать отчёт")
-            await query.edit_message_text(
+            await update.effective_message.reply_text(
                 f"⚠️ Не получилось опубликовать ({e}).\n\nВот текст, скопируй сам(а):\n\n"
                 f"```\n{final_text}\n```",
                 parse_mode="Markdown",
             )
     else:
-        await query.edit_message_text(
+        await update.effective_message.reply_text(
             f"Пока не знаю Cash Report {data['location']}. Скопируй текст и постни сам(а):\n\n"
             f"```\n{final_text}\n```",
             parse_mode="Markdown",
@@ -1171,7 +1171,7 @@ def main() -> None:
     report_conv = ConversationHandler(
         entry_points=[CommandHandler("report", cmd_report)],
         states={
-            R_LOCATION: [CallbackQueryHandler(on_location_picked, pattern=r"^loc::")],
+            R_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_location_text)],
             R_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_revenue)],
             R_TIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_tip), CommandHandler("skip", on_tip)],
             R_CASH_HOLDING: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_cash_holding), CommandHandler("skip", on_cash_holding)],
@@ -1182,7 +1182,7 @@ def main() -> None:
             R_DEFECTIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_defective), CommandHandler("skip", on_defective)],
             R_REMAINING: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_remaining), CommandHandler("skip", on_remaining)],
             R_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_links), CommandHandler("skip", on_links)],
-            R_CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^pub::")],
+            R_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_confirm)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_chat=False,  # стейт привязан к user_id, не к чату
