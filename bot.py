@@ -25,8 +25,16 @@ import datetime as dt
 from pathlib import Path
 
 import anthropic
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
 
 from knowledge import (
     SYSTEM_PROMPT,
@@ -44,6 +52,7 @@ from knowledge import (
     # новое для Этапа 1:
     EMPLOYEES,
     resolve_employee_name,
+    find_employee_by_name,
     LOCATION_KEYWORDS,
     TOPIC_KEYWORDS,
     detect_location,
@@ -538,6 +547,398 @@ def recognize_place(update: Update) -> tuple[str | None, str | None]:
 
 # ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
+# ШАБЛОН END OF SHIFT REPORT — диалог /report в личке
+# ──────────────────────────────────────────────
+# Состояния диалога
+(
+    R_LOCATION,
+    R_REVENUE,
+    R_TIP,
+    R_PHOTOGRAPHERS,
+    R_SALES_BREAKDOWN,
+    R_PHOTOSHOOT_SETS,
+    R_LINKS,
+    R_CONFIRM,
+) = range(8)
+
+
+def get_employee_info(username: str | None) -> dict | None:
+    """По username возвращает полную запись из EMPLOYEES или None."""
+    if not username:
+        return None
+    u = username.lstrip("@")
+    return EMPLOYEES.get(u)
+
+
+def find_cash_report_chat(location: str) -> dict | None:
+    """Ищет в known_places.json запись Cash Report для указанной точки.
+    Возвращает {chat_id, thread_id} или None."""
+    places = load_known_places()
+    for key, info in places.items():
+        if info.get("location") == location and info.get("topic_type") == "cash_report":
+            return {
+                "chat_id": info["chat_id"],
+                "thread_id": info.get("thread_id"),
+            }
+    return None
+
+
+def parse_revenue_line(text: str) -> tuple[int, int, int] | None:
+    """Парсит строку "2300 2000 300" → (total, card, cash). Допускает / и запятые."""
+    cleaned = text.replace("/", " ").replace(",", " ").replace("AED", "").strip()
+    parts = [p for p in cleaned.split() if p]
+    nums = []
+    for p in parts:
+        try:
+            nums.append(int(p))
+        except ValueError:
+            return None
+    if len(nums) != 3:
+        return None
+    total, card, cash = nums
+    if card + cash != total:
+        return None
+    return (total, card, cash)
+
+
+def parse_photographers_line(text: str) -> list[dict] | None:
+    """Парсит "Jennet 1500, Polina Kostyn 800" → [{name, sales, rate, salary}]."""
+    parts = re.split(r"[,;\n]", text)
+    result = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Берём последнее число в строке как продажи, остальное — имя
+        m = re.match(r"^(.+?)\s+(\d+)\s*(?:AED)?$", part, re.IGNORECASE)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        try:
+            sales = int(m.group(2))
+        except ValueError:
+            return None
+        # Ищем сотрудника по имени или алиасу
+        emp = find_employee_by_name(name)
+        rate = emp.get("rate") if emp else None
+        canonical_name = emp.get("name") if emp else name  # каноническое имя из базы
+        salary = int(round(sales * rate)) if rate else None
+        result.append({"name": canonical_name, "sales": sales, "rate": rate, "salary": salary})
+    return result if result else None
+
+
+def format_final_report(data: dict) -> str:
+    """Собирает финальный End of Shift Report БЕЗ пустых полей."""
+    lines = []
+    lines.append(f"📩 End of Shift Report {data['location']}")
+    lines.append(f"Date: {data['date'].strftime('%d-%m-%Y')}")
+    lines.append("")
+    lines.append(f"💰 Total Revenue: {data['total']} AED")
+    lines.append(f"Card: {data['card']} AED")
+    lines.append(f"Cash: {data['cash']} AED")
+    if data.get("tip"):
+        tip = data["tip"]
+        # Tip может быть числом или строкой "100 Polina"
+        lines.append(f"Tip: {tip}")
+    lines.append("")
+
+    # Individual Sales
+    photographers = data.get("photographers", [])
+    if photographers:
+        lines.append("👥 Individual Sales:")
+        for p in photographers:
+            lines.append(f"Photographer {p['name']}: {p['sales']} AED")
+        lines.append("")
+
+    # Salaries — авторасчёт
+    salaried = [p for p in photographers if p.get("salary") is not None]
+    if salaried:
+        lines.append("💼 Salaries:")
+        for p in salaried:
+            lines.append(f"Photographer {p['name']}: {p['salary']} AED")
+        lines.append("")
+
+    # Sales Breakdown
+    if data.get("sales_breakdown"):
+        lines.append("🧾 Sales Breakdown:")
+        lines.append(data["sales_breakdown"].strip())
+        lines.append("")
+
+    # Photoshoot Sets
+    if data.get("photoshoot_sets"):
+        lines.append("📸 Photoshoot Sets:")
+        lines.append(data["photoshoot_sets"].strip())
+        lines.append("")
+
+    # Links
+    if data.get("links"):
+        lines.append("🔗 Links:")
+        lines.append(data["links"].strip())
+
+    return "\n".join(lines).strip()
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Старт диалога /report — только в личке."""
+    chat = update.effective_chat
+    if not chat or chat.type != "private":
+        await update.effective_message.reply_text(
+            "Эту команду используй в личке со мной — там пошагово соберём отчёт."
+        )
+        return ConversationHandler.END
+
+    user = update.effective_user
+    emp = get_employee_info(user.username if user else None)
+    name = emp["name"] if emp else (user.first_name if user else "сотрудник")
+
+    context.user_data["report"] = {
+        "name": name,
+        "username": user.username if user else None,
+        "date": dt.date.today(),
+    }
+
+    locations = list(LOCATION_KEYWORDS.keys())  # Avenue, O Lounge, Chayka, Molodost, Del Mar
+    keyboard = [
+        [InlineKeyboardButton(loc, callback_data=f"loc::{loc}")]
+        for loc in locations
+    ]
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="loc::cancel")])
+
+    await update.effective_message.reply_text(
+        f"Привет, {name}! Закрываем смену 📋\nКакая точка?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return R_LOCATION
+
+
+async def on_location_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка кнопки выбора точки."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "loc::cancel":
+        await query.edit_message_text("Отменено. Когда будешь готова — /report ещё раз.")
+        return ConversationHandler.END
+
+    location = data.split("::", 1)[1]
+    context.user_data["report"]["location"] = location
+
+    await query.edit_message_text(
+        f"📍 Точка: *{location}*\n\n"
+        f"Дальше — выручка одной строкой в формате:\n"
+        f"`Total Card Cash`\n\n"
+        f"Например: `2300 2000 300`",
+        parse_mode="Markdown",
+    )
+    return R_REVENUE
+
+
+async def on_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Парсит выручку."""
+    text = update.effective_message.text or ""
+    parsed = parse_revenue_line(text)
+    if not parsed:
+        await update.effective_message.reply_text(
+            "Не разобрала. Нужно три числа: Total, Card, Cash. И Card + Cash должно = Total.\n"
+            "Пример: `2300 2000 300`",
+            parse_mode="Markdown",
+        )
+        return R_REVENUE
+
+    total, card, cash = parsed
+    context.user_data["report"]["total"] = total
+    context.user_data["report"]["card"] = card
+    context.user_data["report"]["cash"] = cash
+
+    await update.effective_message.reply_text(
+        f"✅ Total {total}, Card {card}, Cash {cash}\n\n"
+        f"💸 Чаевые? Если нет — /skip\n"
+        f"Если есть — напиши сумму и кому (например: `100 Polina`)"
+    )
+    return R_TIP
+
+
+async def on_tip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Чаевые — опциональные."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["report"]["tip"] = text
+
+    await update.effective_message.reply_text(
+        "👥 Фотографы на смене и их продажи?\n"
+        "Формат: `Имя сумма, Имя сумма`\n\n"
+        "Например: `Jennet 1500, Polina Kostyn 800`\n\n"
+        "(Зарплаты я посчитаю сама — по ставкам из базы.)",
+        parse_mode="Markdown",
+    )
+    return R_PHOTOGRAPHERS
+
+
+async def on_photographers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Фотографы и продажи."""
+    text = update.effective_message.text or ""
+    parsed = parse_photographers_line(text)
+    if not parsed:
+        await update.effective_message.reply_text(
+            "Не разобрала. Формат: `Имя сумма, Имя сумма`\n"
+            "Пример: `Jennet 1500, Polina Kostyn 800`",
+            parse_mode="Markdown",
+        )
+        return R_PHOTOGRAPHERS
+
+    # Проверка: сумма по фотографам = total (без чаевых)
+    total_photographers = sum(p["sales"] for p in parsed)
+    expected = context.user_data["report"]["total"]
+    if total_photographers != expected:
+        await update.effective_message.reply_text(
+            f"⚠️ Сумма по фотографам = {total_photographers}, а Total Revenue = {expected}. "
+            f"Не сходится — проверь и пришли ещё раз."
+        )
+        return R_PHOTOGRAPHERS
+
+    context.user_data["report"]["photographers"] = parsed
+
+    # Покажем расчёт зарплат
+    salary_lines = []
+    for p in parsed:
+        if p.get("salary") is not None:
+            salary_lines.append(f"  • {p['name']}: {p['salary']} AED ({int(p['rate']*100)}%)")
+        else:
+            salary_lines.append(f"  • {p['name']}: ставка не найдена, зарплату посчитай вручную")
+
+    salaries_block = "\n".join(salary_lines)
+
+    await update.effective_message.reply_text(
+        f"✅ Зарплаты посчитала:\n{salaries_block}\n\n"
+        f"🧾 Теперь Sales Breakdown — пришли одним сообщением все строки как обычно:\n\n"
+        f"Например:\n"
+        f"1. 300 AED 💳 — 1 Frame, 1 Bag, 1 Business Card with Envelope — +971... — Имя гостя\n"
+        f"2. 500 AED 💵 — 2 w/f, 2 Envelope, 2 Business Card with Envelope — +971... — Имя\n\n"
+        f"Или /skip если строк нет."
+    )
+    return R_SALES_BREAKDOWN
+
+
+async def on_sales_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Sales Breakdown свободным текстом."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["report"]["sales_breakdown"] = text
+
+    await update.effective_message.reply_text(
+        "📸 Photoshoot Sets — пришли одним сообщением.\n\n"
+        "Например:\n"
+        "Set 1: 11\n"
+        "Set 2: 8\n"
+        "Set 3: 12\n\n"
+        "Или /skip."
+    )
+    return R_PHOTOSHOOT_SETS
+
+
+async def on_photoshoot_sets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Сеты свободным текстом."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["report"]["photoshoot_sets"] = text
+
+    await update.effective_message.reply_text(
+        "🔗 Ссылки Pixieset / Google Drive?\n"
+        "Пришли одним сообщением. Или /skip."
+    )
+    return R_LINKS
+
+
+async def on_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ссылки."""
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["report"]["links"] = text
+
+    # Собираем черновик
+    data = context.user_data["report"]
+    draft = format_final_report(data)
+
+    # Проверяем что Марса знает Cash Report этой точки
+    target = find_cash_report_chat(data["location"])
+    if target:
+        publish_hint = f"✅ Опубликую в Cash Report *{data['location']}*."
+    else:
+        publish_hint = (
+            f"⚠️ Я пока не знаю где Cash Report *{data['location']}* — "
+            f"пусть менеджер один раз зайдёт в эту тему и напишет `/whereami`. "
+            f"Сейчас я просто верну тебе готовый текст, скопируешь сама."
+        )
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="pub::yes")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="pub::no")],
+    ]
+
+    await update.effective_message.reply_text(
+        f"Готовый отчёт:\n\n"
+        f"```\n{draft}\n```\n\n"
+        f"{publish_hint}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return R_CONFIRM
+
+
+async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Подтверждение публикации."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+
+    if choice == "pub::no":
+        await query.edit_message_text("Отменено. Когда будешь готова — /report ещё раз.")
+        context.user_data.pop("report", None)
+        return ConversationHandler.END
+
+    # Публикуем
+    data = context.user_data["report"]
+    final_text = format_final_report(data)
+    target = find_cash_report_chat(data["location"])
+
+    if target:
+        try:
+            await context.bot.send_message(
+                chat_id=target["chat_id"],
+                text=final_text,
+                message_thread_id=target.get("thread_id"),
+            )
+            await query.edit_message_text(
+                f"✅ Опубликовала в Cash Report {data['location']}. Хорошей ночи!"
+            )
+        except Exception as e:
+            logger.exception("Не смогла опубликовать отчёт")
+            await query.edit_message_text(
+                f"⚠️ Не получилось опубликовать ({e}).\n\nВот текст, скопируй сама:\n\n"
+                f"```\n{final_text}\n```",
+                parse_mode="Markdown",
+            )
+    else:
+        await query.edit_message_text(
+            f"Я пока не знаю Cash Report {data['location']}. Скопируй текст и постни сама:\n\n"
+            f"```\n{final_text}\n```",
+            parse_mode="Markdown",
+        )
+
+    context.user_data.pop("report", None)
+    return ConversationHandler.END
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Команда /cancel для выхода из диалога."""
+    context.user_data.pop("report", None)
+    await update.effective_message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+
 def main() -> None:
     if "СЮДА_" in TELEGRAM_TOKEN or "СЮДА_" in ANTHROPIC_API_KEY:
         raise SystemExit(
@@ -546,6 +947,25 @@ def main() -> None:
         )
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Диалог /report — только в личке с ботом
+    report_conv = ConversationHandler(
+        entry_points=[CommandHandler("report", cmd_report)],
+        states={
+            R_LOCATION: [CallbackQueryHandler(on_location_picked, pattern=r"^loc::")],
+            R_REVENUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_revenue)],
+            R_TIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_tip), CommandHandler("skip", on_tip)],
+            R_PHOTOGRAPHERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_photographers)],
+            R_SALES_BREAKDOWN: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sales_breakdown), CommandHandler("skip", on_sales_breakdown)],
+            R_PHOTOSHOOT_SETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_photoshoot_sets), CommandHandler("skip", on_photoshoot_sets)],
+            R_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_links), CommandHandler("skip", on_links)],
+            R_CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^pub::")],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        per_chat=False,  # стейт привязан к user_id, не к чату
+    )
+    app.add_handler(report_conv)
+
     app.add_handler(CommandHandler("whereami", cmd_whereami))
     app.add_handler(CommandHandler("locations", cmd_locations))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
