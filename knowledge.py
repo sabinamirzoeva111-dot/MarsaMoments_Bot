@@ -89,13 +89,18 @@ END OF SHIFT REPORT (закрытие) — что проверять:
   НЕ требуй разбивку по Individual Sales в этом случае.
 
 1. АРИФМЕТИКА:
-   а) Total Revenue должно = Card + Cash. Проверь сложением.
+   ВАЖНО ПРО ЧАЕВЫЕ: Tip / Tip For X / Чаевые — это ОТДЕЛЬНАЯ категория,
+   они НЕ входят в Total Revenue, НЕ входят в Sales Breakdown, НЕ входят
+   в Individual Sales. Просто игнорируй чаевые при всех проверках арифметики.
+   
+   а) Total Revenue должно = Card + Cash (БЕЗ чаевых). Проверь сложением.
    б) Если есть блок Individual Sales — сумма по нему = Total Revenue.
    в) Если есть только Salaries (без Individual Sales) и в нём ОДИН фотограф —
       посчитай обратно: Salary ÷ его% = его продажи. Они должны = Total Revenue.
       Пример: Salary Shoira = 950, ставка 20% → 950 / 0.20 = 4750. Если Total
       Revenue тоже 4750 — всё сходится, не ругайся.
    г) Сумма всех строк Sales Breakdown должна = Total Revenue.
+      ПРИ ПОДСЧЁТЕ НЕ ВКЛЮЧАЙ строки "Tip For ..." — это чаевые, не продажа.
 
 2. SALES BREAKDOWN — детальная проверка КАЖДОЙ строки.
    В каждой строке должно быть:
@@ -119,8 +124,9 @@ END OF SHIFT REPORT (закрытие) — что проверять:
    Salary = Individual Sales × процент. Если не сходится — отметь.
    Если есть только один из блоков — НЕ проверяй процент.
 
-4. ЗАПОЛНЕННОСТЬ: Defective Materials, Remaining Consumables — с цифрами,
-   не просто заголовки.
+4. ЗАПОЛНЕННОСТЬ: НЕ ругайся на пустые поля. Если Defective Materials,
+   Remaining Consumables, Expenses (Taxi и подобное), или другие секции
+   пустые/без цифр — это НОРМАЛЬНО. Просто пропусти, не отмечай как проблему.
 
 5. ССЫЛКИ: должна быть хотя бы ОДНА ссылка — Pixieset ИЛИ Google Drive.
    Если есть только Pixieset — ок. Только Google Drive — тоже ок.
@@ -134,6 +140,9 @@ END OF SHIFT REPORT (закрытие) — что проверять:
 - цены продаж и скидки — это не твоя зона
 - отсутствие точки в отчёте — если точка не указана, просто проводи проверку без неё
 - отсутствие имени фотографа в строке Sales Breakdown — не критично, не отмечай
+- ПУСТЫЕ ПОЛЯ И СЕКЦИИ — Expenses, Taxi, Defective Materials, Remaining Consumables
+  и любые другие незаполненные строки. Это норма, не флаг.
+- ЧАЕВЫЕ (Tip) — это отдельная категория, не считается в продажи.
 
 ВТОРНИК (особое):
 Если дата отчёта — вторник, напомни про:
@@ -217,22 +226,24 @@ TEAM_PRAISE_PHRASES = [
     "🏆 {revenue} AED — это уровень. Команда, респект!",
 ]
 
-# Мягкая ругань, когда общая касса < 2500 AED
+# Мягкая обратная связь, когда общая касса < 2500 AED.
+# Тон: дружелюбный, но серьёзный. Без давления, без "не лучший вечер".
 TEAM_SCOLD_PHRASES = [
-    "📉 Касса {revenue} AED — слабовато для смены. Давайте подтянемся в следующий раз.",
-    "📊 Сегодня {revenue} AED — не лучший вечер. Что мешало? Подумайте на следующую смену.",
-    "💭 {revenue} AED — недотянули. Бывает, но цельтесь выше.",
-    "🤔 Только {revenue} AED — есть над чем поработать. Больше подходов к столам, больше кадров.",
-    "📌 {revenue} AED — ниже планки. Не критика, но напоминание: каждый стол — это шанс.",
-    "🔄 Касса {revenue} AED — слабая смена. Завтра играем сильнее.",
+    "📊 Касса {revenue} AED. Думаю на следующую смену сможем сильнее — больше подходов к столам.",
+    "📊 Сегодня {revenue} AED. Бывает по-разному, главное — завтра работаем в полную силу.",
+    "📊 {revenue} AED за смену. Давайте на следующей подкрутим — каждый стол это шанс.",
+    "📊 Касса {revenue} AED. Не критично, но хочется выше — целимся в 5K+ на следующую.",
+    "📊 {revenue} AED. Подумайте что можно улучшить в подходе — следующий вечер делаем сильнее.",
+    "📊 Сегодня {revenue} AED. На следующей смене делаем больше кадров на каждом столе.",
 ]
 
-# Личный недотяг — когда фотограф ниже планки дня недели
+# Личный недотяг — когда фотограф ниже планки дня недели.
+# Тон: дружелюбный, без "недотяг" и "ты ниже".
 INDIVIDUAL_UNDER_PHRASES = [
-    "📊 {name}: {sales} AED — для {day_label} норма от {target}. Недотяг.",
-    "📊 {name} сделал(а) {sales} AED при норме {target}+ для {day_label}. Поработай над подходами.",
-    "📊 {name}: {sales} AED. В {day_label} цельтесь в {target}+, ты ниже.",
-    "📊 У {name} {sales} AED — не дотянул(а) до {target} ({day_label}). Подумай, где зажимался(лась).",
+    "📊 {name}: {sales} AED. В {day_label} норма от {target} — поработай над подходами.",
+    "📊 {name} сделал(а) {sales} AED. Цель для {day_label} — {target}+, давай завтра сильнее.",
+    "📊 У {name} {sales} AED. В {day_label} целимся в {target}+ — подумай где можно добавить.",
+    "📊 {name}: {sales} AED ({day_label} норма {target}+). Бывает, на следующей наверстаем.",
 ]
 
 # Советы по съёмке и работе с гостями — как разговорить, расслабить, получить
@@ -261,28 +272,59 @@ SHOOTING_TIPS = [
 # Для ретушёров ставка не указана (фикс зарплата).
 
 EMPLOYEES = {
+    # General Manager / создатель
+    "kakdelaaaaaa":    {"name": "Sabina",          "role": "gm",
+                        "aliases": ["Сабина", "Sabina Mirzoeva"]},
+
     # Фотографы 20%
-    "anastasigolik":   {"name": "Анастасия",       "role": "photographer", "rate": 0.20},
-    "Shoira2692":      {"name": "Шоира",           "role": "photographer", "rate": 0.20},
-    "jusa1":           {"name": "Полина Лежнина",  "role": "photographer", "rate": 0.20},
+    "anastasigolik":   {"name": "Анастасия",       "role": "photographer", "rate": 0.20,
+                        "aliases": ["Anastasia", "Nastya", "Nastia", "Анастасия Голик", "Голик"]},
+    "Shoira2692":      {"name": "Шоира",           "role": "photographer", "rate": 0.20,
+                        "aliases": ["Shoira", "Shoira Faizova", "Faizova"]},
+    "jusa1":           {"name": "Полина Лежнина",  "role": "photographer", "rate": 0.20,
+                        "aliases": ["Polina Lezhnina", "Lezhnina", "Polina L"]},
     # Fegi — без username, опознаём по номеру
-    "+971523315417":   {"name": "Fegi",            "role": "photographer", "rate": 0.20},
+    "+971523315417":   {"name": "Fegi",            "role": "photographer", "rate": 0.20,
+                        "aliases": ["Fegi Poulose", "Poulose"]},
 
     # Фотографы 15%
-    "Shivu_28":        {"name": "Shivani",         "role": "photographer", "rate": 0.15},
-    "Cennett_00":      {"name": "Jennet",          "role": "photographer", "rate": 0.15},
-    "Umit_Bazarov":    {"name": "Umid",            "role": "photographer", "rate": 0.15},
+    "Shivu_28":        {"name": "Shivani",         "role": "photographer", "rate": 0.15,
+                        "aliases": ["Шивани"]},
+    "Cennett_00":      {"name": "Jennet",          "role": "photographer", "rate": 0.15,
+                        "aliases": ["Jannet", "Дженет", "Дженнет"]},
+    "Umit_Bazarov":    {"name": "Umid",            "role": "photographer", "rate": 0.15,
+                        "aliases": ["Умид", "Umid Bazarov", "Bazarov"]},
     # Бехзод — добавим когда пришлёшь username
 
     # Полина Костын: 10% за цветы, 15% когда работает как фотограф
-    "polina_ksn":      {"name": "Полина Костын",   "role": "photographer", "rate": 0.15},
+    "polina_ksn":      {"name": "Полина Костын",   "role": "photographer", "rate": 0.15,
+                        "aliases": ["Polina Kostyn", "Polina K", "Kostyn", "Костын"]},
 
     # Ретушёры (фикс)
-    "Anasjuttt":       {"name": "Anas",            "role": "retoucher"},
-    "zain_10503":      {"name": "Mahir",           "role": "retoucher"},
-    "+971582506442":   {"name": "Edson",           "role": "retoucher"},
-    "+971547467198":   {"name": "Paddy",           "role": "retoucher"},
+    "Anasjuttt":       {"name": "Anas",            "role": "retoucher",
+                        "aliases": ["Muhammad Anas", "Анас"]},
+    "zain_10503":      {"name": "Mahir",           "role": "retoucher",
+                        "aliases": ["Mahir Pathan", "Pathan", "Махир"]},
+    "+971582506442":   {"name": "Edson",           "role": "retoucher",
+                        "aliases": ["Edson Tum", "Эдсон"]},
+    "+971547467198":   {"name": "Paddy",           "role": "retoucher",
+                        "aliases": ["Paddy Marsa", "Пэдди", "Падди"]},
 }
+
+
+def find_employee_by_name(name: str) -> dict | None:
+    """Ищет сотрудника по имени или любому из алиасов (без учёта регистра).
+    Возвращает запись из EMPLOYEES или None."""
+    if not name:
+        return None
+    target = name.strip().lower()
+    for emp_data in EMPLOYEES.values():
+        if emp_data.get("name", "").lower() == target:
+            return emp_data
+        for alias in emp_data.get("aliases", []):
+            if alias.lower() == target:
+                return emp_data
+    return None
 
 
 def resolve_employee_name(username: str | None, phone: str | None = None,
