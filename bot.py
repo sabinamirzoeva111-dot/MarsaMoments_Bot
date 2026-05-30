@@ -411,9 +411,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Получен отчёт, отправляю на проверку...")
         chat_id = update.effective_chat.id if update.effective_chat else 0
         verdict = check_report(text, chat_id)
-        # Сохраняем оригинал отчёта + вердикт, чтобы потом учесть объяснения
         save_last_report(update.effective_chat.id, text, verdict)
-        await msg.reply_text(verdict)
+        # Если отчёт чистый — просто лайк, не пишем текст
+        clean_markers = ["report is clean", "отчёт чистый", "отчет чистый"]
+        if any(m in verdict.lower() for m in clean_markers):
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    reaction="👍",
+                )
+            except Exception:
+                logger.exception("Не смог поставить реакцию на чистый отчёт")
+        else:
+            await msg.reply_text(verdict)
         return
 
     # 3. Иначе — болтовня, молчим
