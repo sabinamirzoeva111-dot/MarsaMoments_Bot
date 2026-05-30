@@ -444,6 +444,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if topic_type == "instructions":
         return
 
+    # Активный /sale у этого юзера? Обрабатываем ввод
+    if await on_sale_text_input(update, context):
+        return
+
     text = msg.text
 
     # Детект Shift Report (открытие смены) — сохраняем как событие
@@ -2492,75 +2496,20 @@ async def cmd_close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ──────────────────────────────────────────────
-# КОМАНДА /sale — пошаговый ввод одной продажи
+# КОМАНДА /sale — ввод одной продажи через inline-кнопки
+# Бот редактирует ОДНО сообщение в чате, без флуда
 # ──────────────────────────────────────────────
 
-(
-    S_FRAMES,
-    S_WF,
-    S_BAGS,
-    S_ENVELOPES,
-    S_DIGITAL,
-    S_PHONE,
-    S_NAME,
-    S_BC,
-    S_AMOUNT,
-    S_PAYMENT,
-    S_COMMENT,
-    S_CONFIRM,
-) = range(200, 212)
+SALES_STATS_FILE = Path("sales_stats.json")
 
 
-def parse_int_or_skip(text: str, default: int = 0) -> int | None:
-    """Парсит число. /skip или пусто → default. Иначе None если не число."""
-    t = (text or "").strip().lower()
-    if not t or t in ("/skip", "skip", "нет", "no", "0", "-"):
-        return default
-    try:
-        return int(t)
-    except ValueError:
-        return None
-
-
-def parse_yes_no(text: str) -> bool | None:
-    """да/нет → True/False, иначе None."""
-    t = (text or "").strip().lower()
-    if t in ("да", "yes", "y", "+", "ок", "ok", "1"):
-        return True
-    if t in ("нет", "no", "n", "-", "0"):
-        return False
-    return None
-
-
-async def cmd_sale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Старт пошагового ввода продажи. Работает в групповых чатах в любой теме точки."""
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-    if not chat or not user or not msg:
-        return ConversationHandler.END
-
-    # Только для авторизованных
-    emp = get_employee_info(user.username)
-    if not emp:
-        if user:
-            log_unauthorized_access(user)
-        await msg.reply_text(
-            "У тебя нет доступа к этой команде. Обратись к Сабине."
-        )
-        return ConversationHandler.END
-
-    location, _topic = recognize_place(update)
-
-    name = emp["name"]
-    context.user_data["sale"] = {
-        "name": name,
-        "username": user.username,
+def make_blank_sale(user, chat, msg, location: str | None) -> dict:
+    return {
         "user_id": user.id,
         "chat_id": chat.id,
         "thread_id": msg.message_thread_id if msg.is_topic_message else None,
         "location": location,
-        "date": smart_shift_date(),
+        "date": smart_shift_date().isoformat(),
         "frames": 0,
         "wf": 0,
         "bags": 0,
@@ -2568,217 +2517,174 @@ async def cmd_sale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "digital": False,
         "phone": None,
         "guest": None,
-        "business_card": False,
+        "business_card": True,  # по умолчанию ДА — почти всегда даём
         "amount": 0,
-        "cash": 0,
+        "payment": "card",  # card | cash | mixed
         "card": 0,
+        "cash": 0,
         "comment": None,
+        "stage": "items",  # items | digital_q | phone | name | bc_q | amount | payment | comment | confirm
+        "msg_id": None,
+        "number": None,  # порядковый номер в Sales Breakdown за день
     }
 
-    await msg.reply_text(
-        f"📸 Новая продажа. Поехали.\n\n"
-        f"🖼 Фото в рамках — сколько? (число, /skip если 0)"
+
+def format_sale_preview(sale: dict) -> str:
+    """Текст текущего состояния продажи для отображения с кнопками."""
+    parts = []
+    parts.append("📸 *Новая продажа*\n")
+
+    # Состав
+    items_line = (
+        f"🖼 Frame: *{sale['frames']}*  "
+        f"📄 w/f: *{sale['wf']}*\n"
+        f"🛍 Bag: *{sale['bags']}*  "
+        f"✉️ Envelope: *{sale['envelopes']}*"
     )
-    return S_FRAMES
+    parts.append(items_line)
+
+    # Электронка / телефон
+    if sale["digital"]:
+        phone = sale.get("phone") or "не указан"
+        parts.append(f"💾 Digital: *Да*   📞 {phone}")
+    else:
+        parts.append(f"💾 Digital: *Нет*")
+
+    # Гость
+    parts.append(f"👤 Гость: *{sale.get('guest') or '—'}*")
+
+    # Визитка
+    bc = "✅" if sale["business_card"] else "❌"
+    parts.append(f"📇 Business Card: {bc}")
+
+    # Сумма + оплата
+    if sale["amount"]:
+        if sale["payment"] == "card":
+            parts.append(f"💰 *{sale['amount']} AED* — Card 💳")
+        elif sale["payment"] == "cash":
+            parts.append(f"💰 *{sale['amount']} AED* — Cash 💵")
+        else:
+            parts.append(
+                f"💰 *{sale['amount']} AED* — Card {sale['card']} 💳 + Cash {sale['cash']} 💵"
+            )
+    else:
+        parts.append("💰 Сумма: —")
+
+    if sale.get("comment"):
+        parts.append(f"💬 {sale['comment']}")
+
+    return "\n".join(parts)
 
 
-async def on_sale_frames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    val = parse_int_or_skip(update.effective_message.text)
-    if val is None:
-        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
-        return S_FRAMES
-    context.user_data["sale"]["frames"] = val
-    await update.effective_message.reply_text(
-        "📄 Фото без рам (w/f) — сколько? (/skip если 0)"
-    )
-    return S_WF
+def items_keyboard(sale: dict) -> InlineKeyboardMarkup:
+    """Кнопки на шаге 'items': регулируем количество frames/wf/bags/envelopes."""
+    rows = [
+        [
+            InlineKeyboardButton("🖼 Frame −", callback_data="sale:dec:frames"),
+            InlineKeyboardButton(f"{sale['frames']}", callback_data="sale:noop"),
+            InlineKeyboardButton("+", callback_data="sale:inc:frames"),
+        ],
+        [
+            InlineKeyboardButton("📄 w/f −", callback_data="sale:dec:wf"),
+            InlineKeyboardButton(f"{sale['wf']}", callback_data="sale:noop"),
+            InlineKeyboardButton("+", callback_data="sale:inc:wf"),
+        ],
+        [
+            InlineKeyboardButton("🛍 Bag −", callback_data="sale:dec:bags"),
+            InlineKeyboardButton(f"{sale['bags']}", callback_data="sale:noop"),
+            InlineKeyboardButton("+", callback_data="sale:inc:bags"),
+        ],
+        [
+            InlineKeyboardButton("✉️ Env −", callback_data="sale:dec:envelopes"),
+            InlineKeyboardButton(f"{sale['envelopes']}", callback_data="sale:noop"),
+            InlineKeyboardButton("+", callback_data="sale:inc:envelopes"),
+        ],
+        [InlineKeyboardButton("▶️ Дальше", callback_data="sale:next:digital_q")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
-async def on_sale_wf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    val = parse_int_or_skip(update.effective_message.text)
-    if val is None:
-        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
-        return S_WF
-    context.user_data["sale"]["wf"] = val
-
-    sale = context.user_data["sale"]
-    if sale["frames"] + sale["wf"] == 0:
-        await update.effective_message.reply_text(
-            "В продаже должно быть хотя бы одно фото. Сколько фото в рамках?"
-        )
-        return S_FRAMES
-
-    await update.effective_message.reply_text(
-        "🛍 Пакеты — сколько? (/skip если 0)"
-    )
-    return S_BAGS
+def digital_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💾 Digital: Да", callback_data="sale:digital:1"),
+            InlineKeyboardButton("Нет", callback_data="sale:digital:0"),
+        ],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:items")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
+    ])
 
 
-async def on_sale_bags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    val = parse_int_or_skip(update.effective_message.text)
-    if val is None:
-        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
-        return S_BAGS
-    context.user_data["sale"]["bags"] = val
-    await update.effective_message.reply_text(
-        "✉️ Конверты — сколько? (/skip если 0)"
-    )
-    return S_ENVELOPES
+def bc_keyboard(sale: dict) -> InlineKeyboardMarkup:
+    bc = sale["business_card"]
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(("✅ " if bc else "") + "Да", callback_data="sale:bc:1"),
+            InlineKeyboardButton(("✅ " if not bc else "") + "Нет", callback_data="sale:bc:0"),
+        ],
+        [InlineKeyboardButton("▶️ Дальше", callback_data="sale:next:amount")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:name")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
+    ])
 
 
-async def on_sale_envelopes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    val = parse_int_or_skip(update.effective_message.text)
-    if val is None:
-        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
-        return S_ENVELOPES
-    context.user_data["sale"]["envelopes"] = val
-    await update.effective_message.reply_text(
-        "💾 Электронная версия нужна?\nНапиши `да` или `нет`"
-    )
-    return S_DIGITAL
+def payment_keyboard(sale: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💳 Card", callback_data="sale:pay:card"),
+            InlineKeyboardButton("💵 Cash", callback_data="sale:pay:cash"),
+        ],
+        [InlineKeyboardButton("Микс (введу руками)", callback_data="sale:pay:mixed")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:amount")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
+    ])
 
 
-async def on_sale_digital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    val = parse_yes_no(update.effective_message.text)
-    if val is None:
-        await update.effective_message.reply_text("Напиши `да` или `нет`.")
-        return S_DIGITAL
-    context.user_data["sale"]["digital"] = val
-    if val:
-        await update.effective_message.reply_text(
-            "📞 Номер гостя? (формат +971...)"
-        )
-        return S_PHONE
-    # Без электронки — номер не нужен
-    await update.effective_message.reply_text(
-        "👤 Имя гостя или название папки?\n"
-        "Например: `Ahmed`, `Beautiful Couple`, `Gorgeous Girl`"
-    )
-    return S_NAME
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="sale:publish")],
+        [InlineKeyboardButton("💬 Добавить комментарий", callback_data="sale:add_comment")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:payment")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
+    ])
 
 
-async def on_sale_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()
-    # Минимальная валидация — должен начинаться с + и содержать цифры
-    if not re.match(r"^\+?\d[\d\s\-]{6,}$", text):
-        await update.effective_message.reply_text(
-            "Не похоже на номер. Формат: `+971XXXXXXXXX`"
-        )
-        return S_PHONE
-    # Нормализуем
-    normalized = "+" + re.sub(r"\D", "", text).lstrip("+")
-    context.user_data["sale"]["phone"] = normalized
-    await update.effective_message.reply_text(
-        "👤 Имя гостя или название папки?\n"
-        "Например: `Ahmed`, `Beautiful Couple`, `Gorgeous Girl`"
-    )
-    return S_NAME
+def stage_prompt(sale: dict) -> str:
+    """Текст вопроса для текущего этапа, добавляется к превью."""
+    stage = sale["stage"]
+    if stage == "items":
+        return "\n\nНастрой количество и жми *Дальше*"
+    if stage == "digital_q":
+        return "\n\n💾 Электронка нужна?"
+    if stage == "phone":
+        return "\n\n📞 Пришли номер гостя (например +971...)"
+    if stage == "name":
+        return "\n\n👤 Имя гостя или название папки?"
+    if stage == "bc_q":
+        return "\n\n📇 Визитка вложена?"
+    if stage == "amount":
+        return "\n\n💰 Сумма продажи в AED? Просто число"
+    if stage == "payment":
+        return "\n\nКак оплачено?"
+    if stage == "payment_mixed":
+        return f"\n\nПришли `card X cash Y` (сумма = {sale['amount']})"
+    if stage == "comment_input":
+        return "\n\n💬 Пришли комментарий одной строкой"
+    if stage == "confirm":
+        line = build_sale_line_preview(sale)
+        return f"\n\n📋 Финальная строка:\n`{line}`"
+    return ""
 
 
-async def on_sale_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()
-    if not text or text == "/skip":
-        await update.effective_message.reply_text(
-            "Имя гостя обязательно. Например `Ahmed` или `Beautiful Couple`."
-        )
-        return S_NAME
-    context.user_data["sale"]["guest"] = text
-    await update.effective_message.reply_text(
-        "📇 Визитка вложена? `да` / `нет`"
-    )
-    return S_BC
-
-
-async def on_sale_bc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    val = parse_yes_no(update.effective_message.text)
-    if val is None:
-        await update.effective_message.reply_text("Напиши `да` или `нет`.")
-        return S_BC
-    context.user_data["sale"]["business_card"] = val
-    await update.effective_message.reply_text(
-        "💰 Общая сумма продажи в AED? (только число)"
-    )
-    return S_AMOUNT
-
-
-async def on_sale_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    val = parse_int_or_skip(update.effective_message.text, default=None)
-    if val is None or val <= 0:
-        await update.effective_message.reply_text(
-            "Нужно положительное число — сумма продажи в AED."
-        )
-        return S_AMOUNT
-    context.user_data["sale"]["amount"] = val
-    await update.effective_message.reply_text(
-        f"💵 Как оплатили {val} AED?\n"
-        f"Формат: `cash 100, card 200` (или одно из двух — будет считаться что остальное 0).\n"
-        f"Если всё одним способом — `cash {val}` или `card {val}`."
-    )
-    return S_PAYMENT
-
-
-async def on_sale_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip().lower()
-    cash = 0
-    card = 0
-    # Парсим cash X и card X в любом порядке
-    m = re.search(r"cash\s+(\d+)", text)
-    if m:
-        cash = int(m.group(1))
-    m = re.search(r"card\s+(\d+)", text)
-    if m:
-        card = int(m.group(1))
-    # Альтернативные обозначения
-    m = re.search(r"налич\w*\s+(\d+)", text)
-    if m:
-        cash = int(m.group(1))
-    m = re.search(r"карт\w*\s+(\d+)", text)
-    if m:
-        card = int(m.group(1))
-
-    if cash == 0 and card == 0:
-        await update.effective_message.reply_text(
-            "Не понял. Напиши например: `cash 100, card 200` или `card 300`."
-        )
-        return S_PAYMENT
-
-    sale = context.user_data["sale"]
-    expected = sale["amount"]
-    if cash + card != expected:
-        await update.effective_message.reply_text(
-            f"⚠️ Cash + Card = {cash + card}, а сумма продажи = {expected}. Не сходится.\n"
-            f"Пришли ещё раз — например `cash {expected}` если всё наличными, или `card {expected}` если всё картой."
-        )
-        return S_PAYMENT
-
-    sale["cash"] = cash
-    sale["card"] = card
-    await update.effective_message.reply_text(
-        "📝 Комментарий? (если нет — /skip)"
-    )
-    return S_COMMENT
-
-
-async def on_sale_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()
-    if text and text != "/skip":
-        context.user_data["sale"]["comment"] = text
-
-    sale = context.user_data["sale"]
-    formatted = format_sale_line(sale)
-
-    await update.effective_message.reply_text(
-        f"Готово:\n\n{formatted}\n\n"
-        f"Публиковать в чат? Напиши `да` или `нет`."
-    )
-    return S_CONFIRM
-
-
-def format_sale_line(sale: dict) -> str:
-    """Формирует строку Sales Breakdown в стандартном виде."""
-    icon = "💳" if sale["card"] > 0 and sale["cash"] == 0 else (
-        "💵" if sale["cash"] > 0 and sale["card"] == 0 else "💳"
-    )
+def build_sale_line_preview(sale: dict) -> str:
+    """Строка как будет в чате (без номера — он добавится при публикации)."""
+    if sale["payment"] == "card":
+        icon = "💳"
+    elif sale["payment"] == "cash":
+        icon = "💵"
+    else:
+        icon = "💳💵"
 
     parts = []
     if sale["frames"]:
@@ -2790,78 +2696,46 @@ def format_sale_line(sale: dict) -> str:
     if sale["envelopes"]:
         parts.append(f"{sale['envelopes']} Envelope")
     if sale.get("digital"):
-        digital_total = sale["frames"] + sale["wf"]
-        parts.append(f"{digital_total} Digital")
+        d = sale["frames"] + sale["wf"]
+        if d > 0:
+            parts.append(f"{d} Digital")
     if sale["business_card"]:
         parts.append("1 Business Card with Envelope")
-
     items_str = ", ".join(parts) if parts else "—"
 
-    tail_parts = []
     if sale.get("phone"):
-        tail_parts.append(sale["phone"])
+        contact = sale["phone"]
     elif not sale.get("digital"):
-        tail_parts.append("No Need Digital")
+        contact = "No Need Digital"
+    else:
+        contact = ""
 
-    if sale.get("guest"):
-        tail_parts.append(sale["guest"])
+    guest = sale.get("guest") or ""
 
-    photographer = sale.get("name", "")
-    photog_str = f" ({photographer})" if photographer else ""
-
-    tail = " — ".join(tail_parts)
-
-    line = f"💰 {sale['amount']} AED {icon} — {items_str} — {tail}{photog_str}"
-
+    line = f"{sale['amount']} AED {icon} — {items_str}"
+    if contact:
+        line += f" — {contact}"
+    if guest:
+        line += f" — {guest}"
     if sale.get("comment"):
-        line += f"\n   💬 {sale['comment']}"
-
+        line += f"  // {sale['comment']}"
     return line
 
 
-async def on_sale_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip().lower()
-    if text in ("нет", "no", "n", "отмена"):
-        await update.effective_message.reply_text("Отменил. /sale чтобы начать заново.")
-        context.user_data.pop("sale", None)
-        return ConversationHandler.END
-
-    if text not in ("да", "yes", "y", "+", "ок", "ok", "опубликовать"):
-        await update.effective_message.reply_text("Напиши `да` или `нет`.")
-        return S_CONFIRM
-
-    sale = context.user_data["sale"]
-    line = format_sale_line(sale)
-
-    # Публикуем в текущую тему — это сообщение бот сам сохранит как sale_line событие
+def next_sale_number_for_day(chat_id: int, date_iso: str) -> int:
+    """Возвращает следующий порядковый номер продажи за смену."""
     try:
-        await context.bot.send_message(
-            chat_id=sale["chat_id"],
-            text=line,
-            message_thread_id=sale.get("thread_id"),
-        )
-    except Exception as e:
-        await update.effective_message.reply_text(
-            f"⚠️ Не получилось опубликовать ({e}).\n\n{line}"
-        )
-        context.user_data.pop("sale", None)
-        return ConversationHandler.END
-
-    # Сохраняем продажу в накопительную статистику
-    try:
-        save_sale_to_stats(sale)
+        if not SALES_STATS_FILE.exists():
+            return 1
+        data = json.loads(SALES_STATS_FILE.read_text(encoding="utf-8"))
+        sales = data.get("sales", [])
+        count = sum(1 for s in sales if s.get("chat_id") == chat_id and s.get("date") == date_iso)
+        return count + 1
     except Exception:
-        logger.exception("Не смог сохранить продажу в статистику")
-
-    context.user_data.pop("sale", None)
-    return ConversationHandler.END
+        return 1
 
 
-SALES_STATS_FILE = Path("sales_stats.json")
-
-
-def save_sale_to_stats(sale: dict) -> None:
-    """Сохраняет продажу в накопительную статистику."""
+def save_sale_to_stats(sale: dict, number: int) -> None:
     try:
         data = {}
         if SALES_STATS_FILE.exists():
@@ -2869,12 +2743,13 @@ def save_sale_to_stats(sale: dict) -> None:
                 data = json.loads(SALES_STATS_FILE.read_text(encoding="utf-8"))
             except Exception:
                 data = {}
-
         entry = {
             "time": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "date": sale["date"].isoformat() if isinstance(sale.get("date"), dt.date) else None,
+            "date": sale.get("date"),
+            "chat_id": sale.get("chat_id"),
+            "thread_id": sale.get("thread_id"),
             "location": sale.get("location"),
-            "photographer": sale.get("name"),
+            "number": number,
             "frames": sale.get("frames", 0),
             "wf": sale.get("wf", 0),
             "bags": sale.get("bags", 0),
@@ -2882,32 +2757,356 @@ def save_sale_to_stats(sale: dict) -> None:
             "digital": sale.get("digital", False),
             "business_card": sale.get("business_card", False),
             "amount": sale.get("amount", 0),
-            "cash": sale.get("cash", 0),
             "card": sale.get("card", 0),
-            "guest": sale.get("guest"),
+            "cash": sale.get("cash", 0),
             "phone": sale.get("phone"),
+            "guest": sale.get("guest"),
+            "comment": sale.get("comment"),
         }
-
         sales_list = data.get("sales", [])
         sales_list.append(entry)
-        data["sales"] = sales_list[-5000:]  # храним последние 5000
-
-        SALES_STATS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        data["sales"] = sales_list[-5000:]
+        SALES_STATS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     except Exception:
         logger.exception("Не смог сохранить sales_stats")
 
 
-async def cmd_sale_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def keyboard_for_stage(sale: dict) -> InlineKeyboardMarkup | None:
+    stage = sale["stage"]
+    if stage == "items":
+        return items_keyboard(sale)
+    if stage == "digital_q":
+        return digital_keyboard()
+    if stage == "bc_q":
+        return bc_keyboard(sale)
+    if stage == "payment":
+        return payment_keyboard(sale)
+    if stage == "confirm":
+        return confirm_keyboard()
+    # Этапы с текстовым вводом — без клавиатуры,
+    # но с кнопкой "отмена"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")]
+    ])
+
+
+async def render_sale(sale: dict, query=None, message=None, context=None) -> None:
+    """Перерисовывает сообщение бота по текущему состоянию sale."""
+    text = format_sale_preview(sale) + stage_prompt(sale)
+    keyboard = keyboard_for_stage(sale)
+    try:
+        if query is not None:
+            await query.edit_message_text(
+                text, reply_markup=keyboard, parse_mode="Markdown"
+            )
+        elif message is not None and context is not None:
+            sent = await message.reply_text(
+                text, reply_markup=keyboard, parse_mode="Markdown"
+            )
+            sale["msg_id"] = sent.message_id
+    except Exception:
+        logger.exception("Не смог отрисовать sale")
+
+
+async def cmd_sale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
     user = update.effective_user
-    data = context.user_data.get("sale")
-    if not data or not user or data.get("user_id") != user.id:
-        return ConversationHandler.END
-    context.user_data.pop("sale", None)
-    await update.effective_message.reply_text("Продажу отменил.")
-    return ConversationHandler.END
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return
+
+    emp = get_employee_info(user.username)
+    if not emp:
+        if user:
+            log_unauthorized_access(user)
+        await msg.reply_text("У тебя нет доступа. Обратись к Сабине.")
+        return
+
+    location, _ = recognize_place(update)
+    sale = make_blank_sale(user, chat, msg, location)
+
+    # Удаляем команду /sale из чата чтобы не оставлять следов
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    # Сохраняем в bot_data по ключу message_id (после отправки)
+    # А пока — во временное хранилище по user_id
+    if "active_sales" not in context.bot_data:
+        context.bot_data["active_sales"] = {}
+
+    text = format_sale_preview(sale) + stage_prompt(sale)
+    keyboard = keyboard_for_stage(sale)
+    try:
+        sent = await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=sale["thread_id"],
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+        sale["msg_id"] = sent.message_id
+        # Привязываем sale к message_id
+        context.bot_data["active_sales"][sent.message_id] = sale
+    except Exception:
+        logger.exception("Не смог запустить /sale")
+        await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=sale["thread_id"],
+            text="Не получилось запустить ввод продажи.",
+        )
 
 
-def is_reply_to_verdict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def on_sale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка нажатий на кнопки /sale."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+
+    if not query.data.startswith("sale:"):
+        return
+
+    msg = query.message
+    if not msg:
+        return
+
+    sale = context.bot_data.get("active_sales", {}).get(msg.message_id)
+    if not sale:
+        try:
+            await query.edit_message_text("Эта продажа устарела. Запусти /sale заново.")
+        except Exception:
+            pass
+        return
+
+    # Проверка: тот же юзер
+    if query.from_user and query.from_user.id != sale["user_id"]:
+        return  # тихо игнорируем
+
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "noop":
+        return
+
+    if action == "cancel":
+        context.bot_data["active_sales"].pop(msg.message_id, None)
+        try:
+            await query.edit_message_text("Продажа отменена.")
+        except Exception:
+            pass
+        # Удалить через 5 сек
+        return
+
+    if action == "inc":
+        key = parts[2]
+        sale[key] = min(99, sale.get(key, 0) + 1)
+        await render_sale(sale, query=query)
+        return
+
+    if action == "dec":
+        key = parts[2]
+        sale[key] = max(0, sale.get(key, 0) - 1)
+        await render_sale(sale, query=query)
+        return
+
+    if action == "next":
+        target = parts[2]
+        # Проверки переходов
+        if target == "digital_q":
+            if sale["frames"] + sale["wf"] == 0:
+                # Должен быть хотя бы один кадр
+                await query.answer("Нужно хотя бы 1 фото", show_alert=True)
+                return
+            sale["stage"] = "digital_q"
+        elif target == "amount":
+            sale["stage"] = "amount"
+        await render_sale(sale, query=query)
+        return
+
+    if action == "back":
+        target = parts[2]
+        sale["stage"] = target
+        await render_sale(sale, query=query)
+        return
+
+    if action == "digital":
+        sale["digital"] = (parts[2] == "1")
+        if sale["digital"]:
+            sale["stage"] = "phone"
+        else:
+            sale["phone"] = None
+            sale["stage"] = "name"
+        await render_sale(sale, query=query)
+        return
+
+    if action == "bc":
+        sale["business_card"] = (parts[2] == "1")
+        sale["stage"] = "amount"
+        await render_sale(sale, query=query)
+        return
+
+    if action == "pay":
+        choice = parts[2]
+        if choice == "card":
+            sale["payment"] = "card"
+            sale["card"] = sale["amount"]
+            sale["cash"] = 0
+            sale["stage"] = "confirm"
+        elif choice == "cash":
+            sale["payment"] = "cash"
+            sale["cash"] = sale["amount"]
+            sale["card"] = 0
+            sale["stage"] = "confirm"
+        elif choice == "mixed":
+            sale["payment"] = "mixed"
+            sale["stage"] = "payment_mixed"
+        await render_sale(sale, query=query)
+        return
+
+    if action == "add_comment":
+        sale["stage"] = "comment_input"
+        await render_sale(sale, query=query)
+        return
+
+    if action == "publish":
+        await publish_sale(sale, query, context)
+        return
+
+
+async def on_sale_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Текстовый ввод на этапах phone/name/amount/payment_mixed/comment_input.
+    Возвращает True если обработал (чтобы on_text не дублировал)."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not msg.text:
+        return False
+
+    # Ищем активную продажу этого юзера в этом чате
+    active = context.bot_data.get("active_sales", {})
+    sale = None
+    for s in active.values():
+        if s["user_id"] == user.id and s["chat_id"] == update.effective_chat.id:
+            sale = s
+            break
+    if not sale:
+        return False
+
+    stage = sale["stage"]
+    text = msg.text.strip()
+
+    handled = False
+
+    if stage == "phone":
+        if not re.match(r"^\+?\d[\d\s\-]{6,}$", text):
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            return True
+        sale["phone"] = "+" + re.sub(r"\D", "", text).lstrip("+")
+        sale["stage"] = "name"
+        handled = True
+
+    elif stage == "name":
+        sale["guest"] = text
+        sale["stage"] = "bc_q"
+        handled = True
+
+    elif stage == "amount":
+        try:
+            amount = int(re.sub(r"\D", "", text))
+            if amount <= 0:
+                return True
+            sale["amount"] = amount
+            sale["stage"] = "payment"
+            handled = True
+        except ValueError:
+            return True
+
+    elif stage == "payment_mixed":
+        card = 0
+        cash = 0
+        m = re.search(r"card\s+(\d+)", text.lower())
+        if m:
+            card = int(m.group(1))
+        m = re.search(r"cash\s+(\d+)", text.lower())
+        if m:
+            cash = int(m.group(1))
+        if card == 0 and cash == 0:
+            return True
+        if card + cash != sale["amount"]:
+            return True
+        sale["card"] = card
+        sale["cash"] = cash
+        sale["stage"] = "confirm"
+        handled = True
+
+    elif stage == "comment_input":
+        sale["comment"] = text
+        sale["stage"] = "confirm"
+        handled = True
+
+    if not handled:
+        return False
+
+    # Удаляем сообщение юзера и перерисовываем сообщение бота
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=sale["chat_id"],
+            message_id=sale["msg_id"],
+            text=format_sale_preview(sale) + stage_prompt(sale),
+            reply_markup=keyboard_for_stage(sale),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Не смог перерисовать sale после текста")
+
+    return True
+
+
+async def publish_sale(sale: dict, query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Финальная публикация продажи в чат и сохранение в статистику."""
+    # Получаем порядковый номер
+    number = next_sale_number_for_day(sale["chat_id"], sale["date"])
+
+    line_body = build_sale_line_preview(sale)
+    final_line = f"{number}. {line_body}"
+
+    # Удаляем диалоговое сообщение
+    try:
+        await context.bot.delete_message(
+            chat_id=sale["chat_id"], message_id=sale["msg_id"]
+        )
+    except Exception:
+        pass
+
+    # Постим финальную строку
+    try:
+        await context.bot.send_message(
+            chat_id=sale["chat_id"],
+            message_thread_id=sale["thread_id"],
+            text=final_line,
+        )
+    except Exception:
+        logger.exception("Не смог опубликовать продажу")
+
+    # Сохраняем
+    save_sale_to_stats(sale, number)
+
+    # Чистим активную продажу
+    context.bot_data.get("active_sales", {}).pop(sale.get("msg_id"), None)
+
+
+
     """True если сообщение — reply на бот-сообщение с вердиктом/ошибками отчёта,
     а не на текущий вопрос диалога."""
     msg = update.effective_message
@@ -2919,6 +3118,23 @@ def is_reply_to_verdict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return False
     replied_text = msg.reply_to_message.text or ""
     markers = ["Нашёл проблем", "Found", "Отчёт чистый", "Сегодня ", "Касса ", "Проверь", "Sales Breakdown"]
+    return any(m in replied_text for m in markers)
+
+
+def is_reply_to_verdict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True если сообщение — reply на бот-сообщение с вердиктом/ошибками отчёта."""
+    msg = update.effective_message
+    if not msg or not msg.reply_to_message:
+        return False
+    if not msg.reply_to_message.from_user:
+        return False
+    if msg.reply_to_message.from_user.id != context.bot.id:
+        return False
+    replied_text = msg.reply_to_message.text or ""
+    markers = [
+        "Нашёл проблем", "Found", "Отчёт чистый", "Report is clean",
+        "Sales Breakdown", "Lines", "В строках",
+    ]
     return any(m in replied_text for m in markers)
 
 
@@ -3050,27 +3266,9 @@ def main() -> None:
     )
     app.add_handler(close_conv)
 
-    # Диалог /sale — пошаговый ввод одной продажи
-    sale_conv = ConversationHandler(
-        entry_points=[CommandHandler("sale", cmd_sale)],
-        states={
-            S_FRAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_frames), CommandHandler("skip", on_sale_frames)],
-            S_WF: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_wf), CommandHandler("skip", on_sale_wf)],
-            S_BAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_bags), CommandHandler("skip", on_sale_bags)],
-            S_ENVELOPES: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_envelopes), CommandHandler("skip", on_sale_envelopes)],
-            S_DIGITAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_digital)],
-            S_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_phone)],
-            S_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_name)],
-            S_BC: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_bc)],
-            S_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_amount)],
-            S_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_payment)],
-            S_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_comment), CommandHandler("skip", on_sale_comment)],
-            S_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_confirm)],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_sale_cancel)],
-        per_chat=False,
-    )
-    app.add_handler(sale_conv)
+    # Команда /sale — на inline-кнопках (CallbackQueryHandler)
+    app.add_handler(CommandHandler("sale", cmd_sale))
+    app.add_handler(CallbackQueryHandler(on_sale_callback, pattern=r"^sale:"))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whereami", cmd_whereami))
