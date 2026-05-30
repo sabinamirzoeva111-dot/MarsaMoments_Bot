@@ -412,9 +412,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id if update.effective_chat else 0
         verdict = check_report(text, chat_id)
         save_last_report(update.effective_chat.id, text, verdict)
-        # Если отчёт чистый — просто лайк, не пишем текст
-        clean_markers = ["report is clean", "отчёт чистый", "отчет чистый"]
-        if any(m in verdict.lower() for m in clean_markers):
+        # Если отчёт чистый — только лайк, никакого текста
+        if is_clean_verdict(verdict):
             try:
                 await context.bot.set_message_reaction(
                     chat_id=chat_id,
@@ -423,9 +422,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except Exception:
                 logger.exception("Не смог поставить реакцию на чистый отчёт")
+                # Fallback: лайк-эмодзи в reply, если реакция не разрешена
+                try:
+                    await msg.reply_text("👍")
+                except Exception:
+                    pass
         else:
             await msg.reply_text(verdict)
         return
+
+
+def is_clean_verdict(verdict: str) -> bool:
+    """Определяет, чистый ли отчёт по вердикту."""
+    v = (verdict or "").lower()
+    clean_markers = [
+        "report is clean",
+        "отчёт чистый",
+        "отчет чистый",
+        "all good",
+        "no issues",
+        "проблем не нашёл",
+        "ошибок нет",
+    ]
+    return any(m in v for m in clean_markers)
 
     # 3. Иначе — болтовня, молчим
 
@@ -798,17 +817,21 @@ def schedule_all_printers_checks(app) -> None:
         )
 
 
-def collect_sets_from_events(location: str, target_date: dt.date | None = None) -> list[int]:
+def collect_sets_from_events(location: str, target_date: dt.date | None = None, chat_id: int | None = None) -> list[int]:
     """Собирает все сеты из событий за указанную смену.
-    Окно: 20:00 Dubai (target_date) → 10:00 Dubai (target_date+1)."""
+    Окно: 20:00 Dubai (target_date) → 10:00 Dubai (target_date+1).
+    Если chat_id передан — используем его. Иначе ищем через known_places."""
     if target_date is None:
         target_date = dt.date.today()
 
-    places = load_known_places()
-    target_chat_ids = set()
-    for info in places.values():
-        if info.get("location") == location and info.get("topic_type") == "shifts":
-            target_chat_ids.add(info["chat_id"])
+    if chat_id is not None:
+        target_chat_ids = {chat_id}
+    else:
+        places = load_known_places()
+        target_chat_ids = set()
+        for info in places.values():
+            if info.get("location") == location and info.get("topic_type") == "shifts":
+                target_chat_ids.add(info["chat_id"])
 
     if not target_chat_ids:
         return []
@@ -818,8 +841,8 @@ def collect_sets_from_events(location: str, target_date: dt.date | None = None) 
     day_end = day_start + dt.timedelta(hours=14)
 
     sets_collected = []
-    for chat_id in target_chat_ids:
-        for e in events.get(str(chat_id), []):
+    for cid in target_chat_ids:
+        for e in events.get(str(cid), []):
             if e.get("type") != "set":
                 continue
             try:
@@ -2007,20 +2030,15 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    # Ищем Shifts-чат этой точки
-    shifts_chat_id = find_shifts_chat_for_location(location)
-    if not shifts_chat_id:
-        await msg.reply_text(
-            f"Я пока не знаю Shifts-тему *{location}*. "
-            f"Зайди в неё и напиши `/whereami` — тогда смогу собирать данные.",
-            parse_mode="Markdown",
-        )
-        return ConversationHandler.END
+    # В Telegram групповой чат и его темы (Shifts, Cash Report) имеют ОДИН chat_id,
+    # отличаются только thread_id. Так что все события группы (включая sale_line
+    # из Shifts темы) сохранены под этим же chat_id. Не зависим от known_places.
+    shifts_chat_id = chat.id
 
     # СОБИРАЕМ ДАННЫЕ ЗА СМЕНУ (с учётом ночной смены)
     target_date = smart_shift_date()
     sales = collect_sales_from_events(shifts_chat_id, target_date)
-    sets_collected = collect_sets_from_events(location, target_date)
+    sets_collected = collect_sets_from_events(location, target_date, chat_id=shifts_chat_id)
     totals = calc_totals_from_sales(sales)
     photographers = collect_photographers_from_sales(sales)
 
