@@ -195,6 +195,77 @@ def detect_set_size(text: str | None) -> int | None:
     return None
 
 
+def deterministic_sales_breakdown_check(text: str) -> str | None:
+    """Детерминированная проверка Sales Breakdown без LLM.
+    Возвращает текст вердикта или None если требует анализа Claude.
+
+    Применяется только если сообщение — преимущественно Sales Breakdown
+    (нет блоков Total Revenue, Cash Holding и т.д.)."""
+    t = text.lower()
+
+    # Применяем только если это короткий отчёт с Sales Breakdown
+    has_sales = "sales breakdown" in t or bool(re.search(r"\d+\s*aed", text, re.IGNORECASE))
+    has_other_blocks = any(m in t for m in [
+        "total revenue", "card:", "cash:", "cash holding",
+        "individual sales", "salaries", "defective", "remaining",
+        "expenses", "photoshoot sets",
+    ])
+    if not has_sales or has_other_blocks:
+        return None  # пусть Claude разбирает полноценный отчёт
+
+    # Парсим каждую строку
+    lines = split_sales_breakdown(text)
+    if not lines:
+        return None
+
+    issues_by_type = {}  # тип -> список номеров строк
+
+    for i, raw_line in enumerate(lines, 1):
+        parsed = parse_sale_line(raw_line)
+        if not parsed:
+            continue
+        line_lower = raw_line.lower()
+
+        # Чаевые не проверяем
+        if parsed["is_tip"]:
+            continue
+
+        # 1) Business Card with Envelope — должна быть всегда
+        if not re.search(r"business\s*card", line_lower):
+            issues_by_type.setdefault("no_business_card", []).append(i)
+
+        # 2) Имя гостя — после телефона ИЛИ после "No Need Digital"
+        # Грубая эвристика: есть ли что-то осмысленное после телефона/no need digital
+        no_digital = bool(re.search(r"no\s*need\s*digital|без\s*цифров|не\s*нужн.*электрон|no\s*electronic", line_lower))
+        if not parsed["phone"] and not no_digital:
+            issues_by_type.setdefault("no_phone", []).append(i)
+        elif not parsed.get("guest") and not no_digital:
+            # У нас есть телефон, но не вытащилось имя гостя — пропустим, parse_sale_line часто это не вытаскивает корректно
+            pass
+
+    if not issues_by_type:
+        # Все ОК — чистый отчёт
+        return "✅ Report is clean / Отчёт чистый"
+
+    # Формируем вердикт
+    lines_out = ["⚠️ Found issues:"]
+    if "no_business_card" in issues_by_type:
+        nums = ", ".join(str(n) for n in issues_by_type["no_business_card"])
+        lines_out.append(f"• Lines {nums}: missing Business Card with Envelope")
+    if "no_phone" in issues_by_type:
+        nums = ", ".join(str(n) for n in issues_by_type["no_phone"])
+        lines_out.append(f"• Lines {nums}: missing guest phone number")
+    lines_out.append("———")
+    lines_out.append("⚠️ Нашёл проблемы:")
+    if "no_business_card" in issues_by_type:
+        nums = ", ".join(str(n) for n in issues_by_type["no_business_card"])
+        lines_out.append(f"• В строках {nums} нет Business Card with Envelope")
+    if "no_phone" in issues_by_type:
+        nums = ", ".join(str(n) for n in issues_by_type["no_phone"])
+        lines_out.append(f"• В строках {nums} нет номера телефона гостя")
+    return "\n".join(lines_out)
+
+
 def looks_like_report(text: str) -> bool:
     if not text:
         return False
@@ -408,9 +479,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # 2. Это отчёт?
     if looks_like_report(text):
-        logger.info("Получен отчёт, отправляю на проверку...")
         chat_id = update.effective_chat.id if update.effective_chat else 0
-        verdict = check_report(text, chat_id)
+
+        # Сначала пробуем детерминированную проверку (быстро, стабильно)
+        verdict = deterministic_sales_breakdown_check(text)
+        if verdict is None:
+            # Не подходит для детерминированной — спрашиваем Claude
+            logger.info("Получен отчёт, отправляю на проверку Claude...")
+            verdict = check_report(text, chat_id)
+        else:
+            logger.info("Детерминированная проверка Sales Breakdown")
+
         save_last_report(update.effective_chat.id, text, verdict)
         # Если отчёт чистый — только лайк, никакого текста
         if is_clean_verdict(verdict):
@@ -422,7 +501,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except Exception:
                 logger.exception("Не смог поставить реакцию на чистый отчёт")
-                # Fallback: лайк-эмодзи в reply, если реакция не разрешена
                 try:
                     await msg.reply_text("👍")
                 except Exception:
@@ -571,7 +649,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     caption = msg.caption
     add_event(chat.id, "photo", caption, author_of(update))
-    logger.info(f"Фото в чате {chat.id} от {author_of(update)} (подпись: {caption!r})")
+    # Сохраняем артефакт закрытия смены отдельным событием для проверки
+    artifact = detect_shift_close_artifact(caption)
+    if artifact:
+        add_event(chat.id, f"artifact_{artifact}", caption, author_of(update))
+    logger.info(f"Фото в чате {chat.id} от {author_of(update)} (подпись: {caption!r}, артефакт: {artifact})")
 
     if silent:
         return
@@ -704,15 +786,79 @@ def is_shift_report_open(text: str | None) -> bool:
 
 
 def is_printer_photo(caption: str | None) -> bool:
-    """Распознаёт фото принтера по подписи."""
+    """Распознаёт фото принтера по подписи или по факту что подпись пустая
+    и фото похоже на принтер (доверяем контексту чата Shifts)."""
     if not caption:
+        # Пустые фото в Shifts во время смены тоже считаем как фото оборудования
+        # (на ранних этапах смены чаще всего постят именно принтеры)
         return False
     text = caption.lower()
     keywords = [
         "принтер", "printer", "чернил", "ink", "level",
-        "epson", "уровень чернил", "ink level",
+        "epson", "уровень чернил", "ink level", "tank",
+        "l8050", "картридж", "cartridge",
+        "заправ",  # "заправлены", "заправил"
     ]
     return any(kw in text for kw in keywords)
+
+
+def is_battery_photo(caption: str | None) -> bool:
+    """Распознаёт фото батареек на зарядке."""
+    if not caption:
+        return False
+    t = caption.lower()
+    return any(kw in t for kw in [
+        "батарей", "battery", "batteries", "акку", "charging",
+        "зарядк", "заряжа", "charger", "charge",
+    ])
+
+
+def is_desk_photo(caption: str | None) -> bool:
+    """Распознаёт фото рабочего стола."""
+    if not caption:
+        return False
+    t = caption.lower()
+    return any(kw in t for kw in [
+        "рабоч", "стол", "desk", "workplace", "workspace", "стол чистый",
+        "место чисто", "рабочее место",
+    ])
+
+
+def is_shelves_photo(caption: str | None) -> bool:
+    """Распознаёт фото полок с расходниками."""
+    if not caption:
+        return False
+    t = caption.lower()
+    return any(kw in t for kw in [
+        "полк", "shelves", "shelf", "расходник", "materials",
+        "бумаг", "paper stock", "supplies",
+    ])
+
+
+def is_whatsapp_screenshot(caption: str | None) -> bool:
+    """Распознаёт скриншот WhatsApp отправки фото гостям."""
+    if not caption:
+        return False
+    t = caption.lower()
+    return any(kw in t for kw in [
+        "whatsapp", "ватсап", "отправ", "sent", "delivery", "доставлен",
+        "скриншот", "screenshot",
+    ])
+
+
+def detect_shift_close_artifact(caption: str | None) -> str | None:
+    """Возвращает тип артефакта закрытия смены: printer / battery / desk / shelves / whatsapp / None."""
+    if is_printer_photo(caption):
+        return "printer"
+    if is_battery_photo(caption):
+        return "battery"
+    if is_desk_photo(caption):
+        return "desk"
+    if is_shelves_photo(caption):
+        return "shelves"
+    if is_whatsapp_screenshot(caption):
+        return "whatsapp"
+    return None
 
 
 async def check_shift_opening_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2345,6 +2491,422 @@ async def cmd_close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 
+# ──────────────────────────────────────────────
+# КОМАНДА /sale — пошаговый ввод одной продажи
+# ──────────────────────────────────────────────
+
+(
+    S_FRAMES,
+    S_WF,
+    S_BAGS,
+    S_ENVELOPES,
+    S_DIGITAL,
+    S_PHONE,
+    S_NAME,
+    S_BC,
+    S_AMOUNT,
+    S_PAYMENT,
+    S_COMMENT,
+    S_CONFIRM,
+) = range(200, 212)
+
+
+def parse_int_or_skip(text: str, default: int = 0) -> int | None:
+    """Парсит число. /skip или пусто → default. Иначе None если не число."""
+    t = (text or "").strip().lower()
+    if not t or t in ("/skip", "skip", "нет", "no", "0", "-"):
+        return default
+    try:
+        return int(t)
+    except ValueError:
+        return None
+
+
+def parse_yes_no(text: str) -> bool | None:
+    """да/нет → True/False, иначе None."""
+    t = (text or "").strip().lower()
+    if t in ("да", "yes", "y", "+", "ок", "ok", "1"):
+        return True
+    if t in ("нет", "no", "n", "-", "0"):
+        return False
+    return None
+
+
+async def cmd_sale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Старт пошагового ввода продажи. Работает в групповых чатах в любой теме точки."""
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return ConversationHandler.END
+
+    # Только для авторизованных
+    emp = get_employee_info(user.username)
+    if not emp:
+        if user:
+            log_unauthorized_access(user)
+        await msg.reply_text(
+            "У тебя нет доступа к этой команде. Обратись к Сабине."
+        )
+        return ConversationHandler.END
+
+    location, _topic = recognize_place(update)
+
+    name = emp["name"]
+    context.user_data["sale"] = {
+        "name": name,
+        "username": user.username,
+        "user_id": user.id,
+        "chat_id": chat.id,
+        "thread_id": msg.message_thread_id if msg.is_topic_message else None,
+        "location": location,
+        "date": smart_shift_date(),
+        "frames": 0,
+        "wf": 0,
+        "bags": 0,
+        "envelopes": 0,
+        "digital": False,
+        "phone": None,
+        "guest": None,
+        "business_card": False,
+        "amount": 0,
+        "cash": 0,
+        "card": 0,
+        "comment": None,
+    }
+
+    await msg.reply_text(
+        f"📸 Новая продажа. Поехали.\n\n"
+        f"🖼 Фото в рамках — сколько? (число, /skip если 0)"
+    )
+    return S_FRAMES
+
+
+async def on_sale_frames(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    val = parse_int_or_skip(update.effective_message.text)
+    if val is None:
+        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
+        return S_FRAMES
+    context.user_data["sale"]["frames"] = val
+    await update.effective_message.reply_text(
+        "📄 Фото без рам (w/f) — сколько? (/skip если 0)"
+    )
+    return S_WF
+
+
+async def on_sale_wf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    val = parse_int_or_skip(update.effective_message.text)
+    if val is None:
+        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
+        return S_WF
+    context.user_data["sale"]["wf"] = val
+
+    sale = context.user_data["sale"]
+    if sale["frames"] + sale["wf"] == 0:
+        await update.effective_message.reply_text(
+            "В продаже должно быть хотя бы одно фото. Сколько фото в рамках?"
+        )
+        return S_FRAMES
+
+    await update.effective_message.reply_text(
+        "🛍 Пакеты — сколько? (/skip если 0)"
+    )
+    return S_BAGS
+
+
+async def on_sale_bags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    val = parse_int_or_skip(update.effective_message.text)
+    if val is None:
+        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
+        return S_BAGS
+    context.user_data["sale"]["bags"] = val
+    await update.effective_message.reply_text(
+        "✉️ Конверты — сколько? (/skip если 0)"
+    )
+    return S_ENVELOPES
+
+
+async def on_sale_envelopes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    val = parse_int_or_skip(update.effective_message.text)
+    if val is None:
+        await update.effective_message.reply_text("Нужно число. Или /skip если 0.")
+        return S_ENVELOPES
+    context.user_data["sale"]["envelopes"] = val
+    await update.effective_message.reply_text(
+        "💾 Электронная версия нужна?\nНапиши `да` или `нет`"
+    )
+    return S_DIGITAL
+
+
+async def on_sale_digital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    val = parse_yes_no(update.effective_message.text)
+    if val is None:
+        await update.effective_message.reply_text("Напиши `да` или `нет`.")
+        return S_DIGITAL
+    context.user_data["sale"]["digital"] = val
+    if val:
+        await update.effective_message.reply_text(
+            "📞 Номер гостя? (формат +971...)"
+        )
+        return S_PHONE
+    # Без электронки — номер не нужен
+    await update.effective_message.reply_text(
+        "👤 Имя гостя или название папки?\n"
+        "Например: `Ahmed`, `Beautiful Couple`, `Gorgeous Girl`"
+    )
+    return S_NAME
+
+
+async def on_sale_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    # Минимальная валидация — должен начинаться с + и содержать цифры
+    if not re.match(r"^\+?\d[\d\s\-]{6,}$", text):
+        await update.effective_message.reply_text(
+            "Не похоже на номер. Формат: `+971XXXXXXXXX`"
+        )
+        return S_PHONE
+    # Нормализуем
+    normalized = "+" + re.sub(r"\D", "", text).lstrip("+")
+    context.user_data["sale"]["phone"] = normalized
+    await update.effective_message.reply_text(
+        "👤 Имя гостя или название папки?\n"
+        "Например: `Ahmed`, `Beautiful Couple`, `Gorgeous Girl`"
+    )
+    return S_NAME
+
+
+async def on_sale_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    if not text or text == "/skip":
+        await update.effective_message.reply_text(
+            "Имя гостя обязательно. Например `Ahmed` или `Beautiful Couple`."
+        )
+        return S_NAME
+    context.user_data["sale"]["guest"] = text
+    await update.effective_message.reply_text(
+        "📇 Визитка вложена? `да` / `нет`"
+    )
+    return S_BC
+
+
+async def on_sale_bc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    val = parse_yes_no(update.effective_message.text)
+    if val is None:
+        await update.effective_message.reply_text("Напиши `да` или `нет`.")
+        return S_BC
+    context.user_data["sale"]["business_card"] = val
+    await update.effective_message.reply_text(
+        "💰 Общая сумма продажи в AED? (только число)"
+    )
+    return S_AMOUNT
+
+
+async def on_sale_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    val = parse_int_or_skip(update.effective_message.text, default=None)
+    if val is None or val <= 0:
+        await update.effective_message.reply_text(
+            "Нужно положительное число — сумма продажи в AED."
+        )
+        return S_AMOUNT
+    context.user_data["sale"]["amount"] = val
+    await update.effective_message.reply_text(
+        f"💵 Как оплатили {val} AED?\n"
+        f"Формат: `cash 100, card 200` (или одно из двух — будет считаться что остальное 0).\n"
+        f"Если всё одним способом — `cash {val}` или `card {val}`."
+    )
+    return S_PAYMENT
+
+
+async def on_sale_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip().lower()
+    cash = 0
+    card = 0
+    # Парсим cash X и card X в любом порядке
+    m = re.search(r"cash\s+(\d+)", text)
+    if m:
+        cash = int(m.group(1))
+    m = re.search(r"card\s+(\d+)", text)
+    if m:
+        card = int(m.group(1))
+    # Альтернативные обозначения
+    m = re.search(r"налич\w*\s+(\d+)", text)
+    if m:
+        cash = int(m.group(1))
+    m = re.search(r"карт\w*\s+(\d+)", text)
+    if m:
+        card = int(m.group(1))
+
+    if cash == 0 and card == 0:
+        await update.effective_message.reply_text(
+            "Не понял. Напиши например: `cash 100, card 200` или `card 300`."
+        )
+        return S_PAYMENT
+
+    sale = context.user_data["sale"]
+    expected = sale["amount"]
+    if cash + card != expected:
+        await update.effective_message.reply_text(
+            f"⚠️ Cash + Card = {cash + card}, а сумма продажи = {expected}. Не сходится.\n"
+            f"Пришли ещё раз — например `cash {expected}` если всё наличными, или `card {expected}` если всё картой."
+        )
+        return S_PAYMENT
+
+    sale["cash"] = cash
+    sale["card"] = card
+    await update.effective_message.reply_text(
+        "📝 Комментарий? (если нет — /skip)"
+    )
+    return S_COMMENT
+
+
+async def on_sale_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["sale"]["comment"] = text
+
+    sale = context.user_data["sale"]
+    formatted = format_sale_line(sale)
+
+    await update.effective_message.reply_text(
+        f"Готово:\n\n{formatted}\n\n"
+        f"Публиковать в чат? Напиши `да` или `нет`."
+    )
+    return S_CONFIRM
+
+
+def format_sale_line(sale: dict) -> str:
+    """Формирует строку Sales Breakdown в стандартном виде."""
+    icon = "💳" if sale["card"] > 0 and sale["cash"] == 0 else (
+        "💵" if sale["cash"] > 0 and sale["card"] == 0 else "💳"
+    )
+
+    parts = []
+    if sale["frames"]:
+        parts.append(f"{sale['frames']} Frame")
+    if sale["wf"]:
+        parts.append(f"{sale['wf']} w/f")
+    if sale["bags"]:
+        parts.append(f"{sale['bags']} Bag")
+    if sale["envelopes"]:
+        parts.append(f"{sale['envelopes']} Envelope")
+    if sale.get("digital"):
+        digital_total = sale["frames"] + sale["wf"]
+        parts.append(f"{digital_total} Digital")
+    if sale["business_card"]:
+        parts.append("1 Business Card with Envelope")
+
+    items_str = ", ".join(parts) if parts else "—"
+
+    tail_parts = []
+    if sale.get("phone"):
+        tail_parts.append(sale["phone"])
+    elif not sale.get("digital"):
+        tail_parts.append("No Need Digital")
+
+    if sale.get("guest"):
+        tail_parts.append(sale["guest"])
+
+    photographer = sale.get("name", "")
+    photog_str = f" ({photographer})" if photographer else ""
+
+    tail = " — ".join(tail_parts)
+
+    line = f"💰 {sale['amount']} AED {icon} — {items_str} — {tail}{photog_str}"
+
+    if sale.get("comment"):
+        line += f"\n   💬 {sale['comment']}"
+
+    return line
+
+
+async def on_sale_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip().lower()
+    if text in ("нет", "no", "n", "отмена"):
+        await update.effective_message.reply_text("Отменил. /sale чтобы начать заново.")
+        context.user_data.pop("sale", None)
+        return ConversationHandler.END
+
+    if text not in ("да", "yes", "y", "+", "ок", "ok", "опубликовать"):
+        await update.effective_message.reply_text("Напиши `да` или `нет`.")
+        return S_CONFIRM
+
+    sale = context.user_data["sale"]
+    line = format_sale_line(sale)
+
+    # Публикуем в текущую тему — это сообщение бот сам сохранит как sale_line событие
+    try:
+        await context.bot.send_message(
+            chat_id=sale["chat_id"],
+            text=line,
+            message_thread_id=sale.get("thread_id"),
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(
+            f"⚠️ Не получилось опубликовать ({e}).\n\n{line}"
+        )
+        context.user_data.pop("sale", None)
+        return ConversationHandler.END
+
+    # Сохраняем продажу в накопительную статистику
+    try:
+        save_sale_to_stats(sale)
+    except Exception:
+        logger.exception("Не смог сохранить продажу в статистику")
+
+    context.user_data.pop("sale", None)
+    return ConversationHandler.END
+
+
+SALES_STATS_FILE = Path("sales_stats.json")
+
+
+def save_sale_to_stats(sale: dict) -> None:
+    """Сохраняет продажу в накопительную статистику."""
+    try:
+        data = {}
+        if SALES_STATS_FILE.exists():
+            try:
+                data = json.loads(SALES_STATS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+
+        entry = {
+            "time": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "date": sale["date"].isoformat() if isinstance(sale.get("date"), dt.date) else None,
+            "location": sale.get("location"),
+            "photographer": sale.get("name"),
+            "frames": sale.get("frames", 0),
+            "wf": sale.get("wf", 0),
+            "bags": sale.get("bags", 0),
+            "envelopes": sale.get("envelopes", 0),
+            "digital": sale.get("digital", False),
+            "business_card": sale.get("business_card", False),
+            "amount": sale.get("amount", 0),
+            "cash": sale.get("cash", 0),
+            "card": sale.get("card", 0),
+            "guest": sale.get("guest"),
+            "phone": sale.get("phone"),
+        }
+
+        sales_list = data.get("sales", [])
+        sales_list.append(entry)
+        data["sales"] = sales_list[-5000:]  # храним последние 5000
+
+        SALES_STATS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Не смог сохранить sales_stats")
+
+
+async def cmd_sale_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    data = context.user_data.get("sale")
+    if not data or not user or data.get("user_id") != user.id:
+        return ConversationHandler.END
+    context.user_data.pop("sale", None)
+    await update.effective_message.reply_text("Продажу отменил.")
+    return ConversationHandler.END
+
+
 def is_reply_to_verdict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """True если сообщение — reply на бот-сообщение с вердиктом/ошибками отчёта,
     а не на текущий вопрос диалога."""
@@ -2487,6 +3049,28 @@ def main() -> None:
         per_chat=False,
     )
     app.add_handler(close_conv)
+
+    # Диалог /sale — пошаговый ввод одной продажи
+    sale_conv = ConversationHandler(
+        entry_points=[CommandHandler("sale", cmd_sale)],
+        states={
+            S_FRAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_frames), CommandHandler("skip", on_sale_frames)],
+            S_WF: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_wf), CommandHandler("skip", on_sale_wf)],
+            S_BAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_bags), CommandHandler("skip", on_sale_bags)],
+            S_ENVELOPES: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_envelopes), CommandHandler("skip", on_sale_envelopes)],
+            S_DIGITAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_digital)],
+            S_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_phone)],
+            S_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_name)],
+            S_BC: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_bc)],
+            S_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_amount)],
+            S_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_payment)],
+            S_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_comment), CommandHandler("skip", on_sale_comment)],
+            S_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_sale_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_sale_cancel)],
+        per_chat=False,
+    )
+    app.add_handler(sale_conv)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whereami", cmd_whereami))
