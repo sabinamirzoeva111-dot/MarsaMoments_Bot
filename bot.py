@@ -49,12 +49,17 @@ from knowledge import (
     TEAM_PRAISE_PHRASES,
     TEAM_SCOLD_PHRASES,
     INDIVIDUAL_UNDER_PHRASES,
+    GREETINGS_START,
+    GREETINGS_REPORT_START,
+    SALARY_QUIPS,
     # новое для Этапа 1:
     EMPLOYEES,
     resolve_employee_name,
     find_employee_by_name,
     LOCATION_KEYWORDS,
     TOPIC_KEYWORDS,
+    SHIFT_START_HOURS,
+    PRINTERS_DEADLINE_MINUTES,
     detect_location,
     detect_topic_type,
 )
@@ -362,13 +367,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Запоминаем место (автораспознавание точки и темы)
-    recognize_place(update)
+    location, topic_type = recognize_place(update)
+
+    # В Instructions & Reminders — молчим
+    if topic_type == "instructions":
+        return
 
     text = msg.text
+
+    # Детект Shift Report (открытие смены) — сохраняем как событие
+    if is_shift_report_open(text):
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        if chat_id:
+            add_event(chat_id, "shift_report_open", text[:200], author_of(update))
+
+    # Детект строк Sales Breakdown по ходу смены (с иконкой 💳 или 💵)
+    if is_sale_line(text):
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        if chat_id:
+            add_event(chat_id, "sale_line", text, author_of(update))
+
+    # 0. Это reply на сообщение Марсы? — обработка объяснения
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        bot_id = context.bot.id
+        if msg.reply_to_message.from_user.id == bot_id:
+            # Человек отвечает на сообщение Марсы — это объяснение
+            await handle_explanation_reply(update, context)
+            return
 
     # 1. Это сет? — реагируем мгновенно, без Claude
     n = detect_set_size(text)
     if n is not None:
+        # Сохраняем сет как событие для автосбора в /report
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        if chat_id:
+            add_event(chat_id, "set", f"size={n}", author_of(update))
         if n < SET_MIN_PHOTOS:
             await msg.reply_text(make_set_reminder(n))
         return  # сет обработан, дальше не идём
@@ -378,10 +411,105 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Получен отчёт, отправляю на проверку...")
         chat_id = update.effective_chat.id if update.effective_chat else 0
         verdict = check_report(text, chat_id)
+        # Сохраняем оригинал отчёта + вердикт, чтобы потом учесть объяснения
+        save_last_report(update.effective_chat.id, text, verdict)
         await msg.reply_text(verdict)
         return
 
     # 3. Иначе — болтовня, молчим
+
+
+# ──────────────────────────────────────────────
+# REPLY-ДИАЛОГ: ретушёр объясняет ситуацию по ошибке
+# ──────────────────────────────────────────────
+
+LAST_REPORTS_FILE = Path("last_reports.json")
+
+
+def save_last_report(chat_id: int, report_text: str, verdict: str) -> None:
+    """Сохраняет последний отчёт и вердикт в этом чате для контекста объяснений."""
+    try:
+        data = {}
+        if LAST_REPORTS_FILE.exists():
+            try:
+                data = json.loads(LAST_REPORTS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data[str(chat_id)] = {
+            "report": report_text,
+            "verdict": verdict,
+            "time": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        LAST_REPORTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Не смог сохранить last_reports")
+
+
+def get_last_report(chat_id: int) -> dict | None:
+    """Возвращает последний отчёт+вердикт для чата (если был в последние 6 часов)."""
+    if not LAST_REPORTS_FILE.exists():
+        return None
+    try:
+        data = json.loads(LAST_REPORTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    entry = data.get(str(chat_id))
+    if not entry:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(entry["time"])
+    except Exception:
+        return None
+    if dt.datetime.now(dt.timezone.utc) - t > dt.timedelta(hours=6):
+        return None
+    return entry
+
+
+async def handle_explanation_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Когда сотрудник ответил reply на сообщение Марсы — учитываем объяснение."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+
+    explanation = msg.text or ""
+    bot_message_text = msg.reply_to_message.text or ""
+
+    # Достаём последний отчёт в этом чате (для контекста)
+    last = get_last_report(chat.id)
+
+    # Формируем промпт для Claude — пересмотр с учётом объяснения
+    user_prompt = (
+        "В предыдущем сообщении я (Марса) написал следующее по поводу отчёта:\n\n"
+        f"{bot_message_text}\n\n"
+        f"Сотрудник ответил с объяснением:\n\n«{explanation}»\n\n"
+    )
+    if last:
+        user_prompt += f"Оригинальный отчёт был такой:\n\n{last['report']}\n\n"
+    user_prompt += (
+        "Учти объяснение. Если оно убедительно объясняет одну из проблем "
+        "(например: «забыл конверт, отдам в следующий раз», «гость отказался от номера», "
+        "«опечатка в номере»), то признай это и обнови свой вердикт — убери эту проблему "
+        "из списка, кратко скажи что принял объяснение. "
+        "Если в отчёте всё ещё остаются проблемы — перечисли только оставшиеся. "
+        "Если объяснение не убирает проблемы — мягко скажи об этом. "
+        "Будь кратким, по делу, без преамбул."
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=600,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        reply_text = response.content[0].text.strip()
+    except Exception as e:
+        logger.exception("Ошибка при обработке объяснения")
+        reply_text = f"Не смог обработать объяснение (техническая ошибка): {e}"
+
+    await msg.reply_text(reply_text)
 
 
 def make_set_reminder(n: int) -> str:
@@ -406,16 +534,24 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Запоминаем место
-    recognize_place(update)
+    location, topic_type = recognize_place(update)
+
+    # В Instructions & Reminders — молчим (но событие сохраняем)
+    silent = (topic_type == "instructions")
 
     caption = msg.caption
     add_event(chat.id, "photo", caption, author_of(update))
     logger.info(f"Фото в чате {chat.id} от {author_of(update)} (подпись: {caption!r})")
 
-    # Если в подписи распознался сет — проверяем размер
+    if silent:
+        return
+
+    # Если в подписи распознался сет — проверяем размер и сохраняем
     n = detect_set_size(caption)
-    if n is not None and n < SET_MIN_PHOTOS:
-        await msg.reply_text(make_set_reminder(n))
+    if n is not None:
+        add_event(chat.id, "set", f"size={n}", author_of(update))
+        if n < SET_MIN_PHOTOS:
+            await msg.reply_text(make_set_reminder(n))
 
 
 async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -427,10 +563,504 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Запоминаем место
-    recognize_place(update)
+    location, topic_type = recognize_place(update)
 
     add_event(chat.id, "location", None, author_of(update))
     logger.info(f"Геолокация в чате {chat.id} от {author_of(update)}")
+
+    # В Instructions & Reminders — молчим дальше
+    if topic_type == "instructions":
+        return
+
+    # Анализ времени геолокации против начала смены
+    if location:
+        shift_start = SHIFT_START_HOURS.get(location)
+        if shift_start is not None:
+            # Dubai UTC+4 — переводим текущее UTC в локальное
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            now_dubai = now_utc + dt.timedelta(hours=4)
+            now_h, now_m = now_dubai.hour, now_dubai.minute
+
+            on_time = (now_h < shift_start) or (now_h == shift_start and now_m == 0)
+
+            if on_time:
+                # Лайк за пунктуальность
+                try:
+                    await context.bot.set_message_reaction(
+                        chat_id=chat.id,
+                        message_id=msg.message_id,
+                        reaction="👍",
+                    )
+                except Exception:
+                    logger.exception("Не смог поставить реакцию на геолокацию")
+            else:
+                # Опоздание — фиксируем и считаем
+                user = update.effective_user
+                username = (user.username if user else None) or f"id{user.id if user else 0}"
+                count = record_lateness(username, location)
+                minutes_late = (now_h - shift_start) * 60 + now_m
+                await handle_lateness(msg, username, count, minutes_late, location)
+
+
+LATENESS_FILE = Path("lateness.json")
+
+
+def record_lateness(username: str, location: str) -> int:
+    """Записывает опоздание сотрудника в текущем месяце.
+    Возвращает счётчик опозданий за этот месяц."""
+    try:
+        data = {}
+        if LATENESS_FILE.exists():
+            try:
+                data = json.loads(LATENESS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+
+        # Ключ — username + год-месяц (счётчик обнуляется каждый месяц)
+        ym = dt.date.today().strftime("%Y-%m")
+        key = f"{username}::{ym}"
+
+        entry = data.get(key, {"count": 0, "incidents": []})
+        entry["count"] += 1
+        entry["incidents"].append({
+            "time": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "location": location,
+        })
+        data[key] = entry
+
+        LATENESS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return entry["count"]
+    except Exception:
+        logger.exception("Не смог записать опоздание")
+        return 0
+
+
+async def handle_lateness(msg, username: str, count: int, minutes_late: int, location: str) -> None:
+    """Реагирует на опоздание в зависимости от того какое оно по счёту."""
+    if count == 1:
+        text = (
+            f"⏰ Геолокация пришла на {minutes_late} минут позже начала смены.\n"
+            f"Это первое опоздание в этом месяце — не критично, но в следующий раз постарайся приходить вовремя."
+        )
+    elif count == 2:
+        text = (
+            f"⏰ Геолокация пришла на {minutes_late} минут позже начала смены.\n"
+            f"Это уже второе опоздание в этом месяце. Следующее будет со штрафом."
+        )
+    else:
+        text = (
+            f"⏰ Геолокация пришла на {minutes_late} минут позже начала смены.\n"
+            f"Это {count}-е опоздание в этом месяце — штраф 50 AED."
+        )
+
+    try:
+        await msg.reply_text(text)
+    except Exception:
+        logger.exception("Не смог отправить уведомление об опоздании")
+
+
+def is_shift_report_open(text: str | None) -> bool:
+    """Распознаёт Shift Report (открытие смены) по характерным маркерам."""
+    if not text:
+        return False
+    t = text.lower()
+    # Должны быть и shift report маркер, и упоминание оборудования
+    has_header = "shift report" in t
+    has_equipment = any(kw in t for kw in [
+        "equipment list", "macbook", "canon", "epson", "godox", "sigma",
+        "team on shift", "equipment status",
+    ])
+    return has_header and has_equipment
+
+
+def is_printer_photo(caption: str | None) -> bool:
+    """Распознаёт фото принтера по подписи."""
+    if not caption:
+        return False
+    text = caption.lower()
+    keywords = [
+        "принтер", "printer", "чернил", "ink", "level",
+        "epson", "уровень чернил", "ink level",
+    ]
+    return any(kw in text for kw in keywords)
+
+
+async def check_shift_opening_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Проверяет, что в Shifts-теме до дедлайна были все элементы открытия:
+    - геолокация
+    - Shift Report (текст со списком оборудования)
+    - фото уровня чернил принтеров
+    Если что-то отсутствует — пишет в чат список пропущенных пунктов."""
+    job = context.job
+    chat_id = job.data["chat_id"]
+    location = job.data["location"]
+    thread_id = job.data.get("thread_id")
+
+    # Смотрим события за последние ~4 часа
+    events = load_events().get(str(chat_id), [])
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
+
+    has_location = False
+    has_shift_report = False
+    has_printer_photo = False
+    for e in events:
+        try:
+            t = dt.datetime.fromisoformat(e["time"])
+        except Exception:
+            continue
+        if t < cutoff:
+            continue
+        if e.get("type") == "location":
+            has_location = True
+        if e.get("type") == "shift_report_open":
+            has_shift_report = True
+        if e.get("type") == "photo" and is_printer_photo(e.get("caption")):
+            has_printer_photo = True
+
+    missing = []
+    if not has_location:
+        missing.append("• геолокацию")
+    if not has_shift_report:
+        missing.append("• Shift Report со списком оборудования")
+    if not has_printer_photo:
+        missing.append("• фото уровня чернил принтеров")
+
+    if not missing:
+        logger.info(f"Открытие смены ок ({location})")
+        return
+
+    try:
+        text = "⏰ Открытие смены не закрыто. Не вижу:\n" + "\n".join(missing)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=text,
+        )
+        logger.info(f"Напоминание об открытии смены в чат {chat_id} ({location}): {missing}")
+    except Exception:
+        logger.exception(f"Не смог отправить напоминание в {chat_id}")
+
+
+def schedule_printers_check(app, chat_id: int, location: str, thread_id: int | None = None) -> None:
+    """Планирует ежедневную проверку открытия смены для указанной точки.
+    Время дедлайна = SHIFT_START_HOURS[location]:30 локального времени Дубая (UTC+4)."""
+    start_hour = SHIFT_START_HOURS.get(location)
+    if start_hour is None:
+        return
+
+    # Дубай = UTC+4. Render контейнер в UTC.
+    deadline_local_hour = start_hour
+    deadline_local_minute = PRINTERS_DEADLINE_MINUTES
+    deadline_utc_hour = (deadline_local_hour - 4) % 24
+    deadline_time = dt.time(hour=deadline_utc_hour, minute=deadline_local_minute, tzinfo=dt.timezone.utc)
+
+    job_name = f"shift_opening_check_{chat_id}_{thread_id or 0}"
+    for old_job in app.job_queue.get_jobs_by_name(job_name):
+        old_job.schedule_removal()
+
+    app.job_queue.run_daily(
+        check_shift_opening_deadline,
+        time=deadline_time,
+        data={"chat_id": chat_id, "location": location, "thread_id": thread_id},
+        name=job_name,
+    )
+    logger.info(
+        f"Запланирована проверка открытия смены: {location} (chat={chat_id}, "
+        f"thread={thread_id}) в {deadline_time} UTC"
+    )
+
+
+def schedule_all_printers_checks(app) -> None:
+    """При старте бота — планируем проверки для всех известных точек/тем Shifts."""
+    places = load_known_places()
+    for key, info in places.items():
+        if info.get("topic_type") != "shifts":
+            continue
+        location = info.get("location")
+        if location not in SHIFT_START_HOURS:
+            continue
+        schedule_printers_check(
+            app,
+            chat_id=info["chat_id"],
+            location=location,
+            thread_id=info.get("thread_id"),
+        )
+
+
+def collect_sets_from_events(location: str, target_date: dt.date | None = None) -> list[int]:
+    """Собирает все сеты из событий за указанный день в Shifts-теме указанной точки.
+    Возвращает список размеров (порядок — по времени). Если ничего нет — пустой список."""
+    if target_date is None:
+        target_date = dt.date.today()
+
+    places = load_known_places()
+    # Ищем Shifts-тему этой точки
+    target_chat_ids = set()
+    for info in places.values():
+        if info.get("location") == location and info.get("topic_type") == "shifts":
+            target_chat_ids.add(info["chat_id"])
+
+    if not target_chat_ids:
+        return []
+
+    events = load_events()
+    # Дубай UTC+4 — день начинается в 20:00 UTC предыдущего дня
+    # Берём окно событий: с 16:00 UTC дня (≈20:00 Dubai) до +12 часов
+    day_start_local = dt.datetime.combine(target_date, dt.time(16, 0), dt.timezone.utc)
+    day_end_local = day_start_local + dt.timedelta(hours=14)  # до 06:00 UTC = 10:00 Dubai
+
+    sets_collected = []
+    for chat_id in target_chat_ids:
+        for e in events.get(str(chat_id), []):
+            if e.get("type") != "set":
+                continue
+            try:
+                t = dt.datetime.fromisoformat(e["time"])
+            except Exception:
+                continue
+            if not (day_start_local <= t <= day_end_local):
+                continue
+            caption = e.get("caption") or ""
+            m = re.search(r"size=(\d+)", caption)
+            if m:
+                sets_collected.append(int(m.group(1)))
+
+    return sets_collected
+
+
+# ──────────────────────────────────────────────
+# АВТОСБОР SALES BREAKDOWN ИЗ ЧАТА SHIFTS
+# ──────────────────────────────────────────────
+
+def is_sale_line(text: str) -> bool:
+    """Распознаёт строку продажи (содержит сумму AED + иконку оплаты)."""
+    if not text:
+        return False
+    has_aed = bool(re.search(r"\d+\s*aed", text, re.IGNORECASE))
+    has_icon = "💳" in text or "💵" in text
+    return has_aed and has_icon
+
+
+def parse_sale_line(text: str) -> dict | None:
+    """Парсит строку Sales Breakdown.
+    Возвращает dict с полями amount, payment ('card'/'cash'), is_tip, materials, phone, guest, photographer."""
+    if not text:
+        return None
+
+    # Сумма AED
+    m = re.search(r"(\d+)\s*AED", text, re.IGNORECASE)
+    if not m:
+        return None
+    amount = int(m.group(1))
+
+    # Тип оплаты
+    if "💳" in text:
+        payment = "card"
+    elif "💵" in text:
+        payment = "cash"
+    else:
+        return None
+
+    # Это чаевые?
+    is_tip = bool(re.search(r"\btip\b|чаев", text, re.IGNORECASE))
+
+    # Материалы: считаем по подсказкам
+    materials = {
+        "w_f": 0,        # without frame (w/f)
+        "frame": 0,
+        "envelope": 0,
+        "bag": 0,
+        "business_card": 0,
+        "bc_envelope": 0,
+        "digital": 0,
+    }
+    # w/f → сколько штук без рамки
+    for n in re.findall(r"(\d+)\s*w/f", text, re.IGNORECASE):
+        materials["w_f"] += int(n)
+    # Frame (не Frames в Bus.Card)
+    for n in re.findall(r"(\d+)\s*Frame(?!s?\s*by)", text, re.IGNORECASE):
+        materials["frame"] += int(n)
+    # Bag(s)
+    for n in re.findall(r"(\d+)\s*Bag", text, re.IGNORECASE):
+        materials["bag"] += int(n)
+    # Business Card with Envelope — визитка + её собственный маленький конверт
+    bc_count = 0
+    for n in re.findall(r"(\d+)\s*Business\s*Card", text, re.IGNORECASE):
+        bc_count += int(n)
+    materials["business_card"] = bc_count
+    # Конверт для визитки появляется только когда явно написано "with Envelope"
+    if re.search(r"Business\s*Card\s*with\s*Envelope", text, re.IGNORECASE):
+        materials["bc_envelope"] = bc_count
+
+    # A4 Envelope для фото — считаем "Envelope" минус "with Envelope" от визитки
+    # Сначала удаляем "with Envelope" из текста, потом ищем оставшиеся Envelope
+    text_no_bc_env = re.sub(r"Business\s*Card\s*with\s*Envelope", "", text, flags=re.IGNORECASE)
+    for n in re.findall(r"(\d+)\s*Envelope", text_no_bc_env, re.IGNORECASE):
+        materials["envelope"] += int(n)
+
+    # Digital
+    for n in re.findall(r"(\d+)\s*Digital", text, re.IGNORECASE):
+        materials["digital"] += int(n)
+
+    # Телефон
+    phone_m = re.search(r"\+\d[\d\s\-]{6,}", text)
+    phone = phone_m.group(0).strip() if phone_m else None
+
+    # Фотограф в скобках в конце
+    photog_m = re.search(r"\(([^)]+)\)\s*$", text)
+    photographer = photog_m.group(1).strip() if photog_m else None
+
+    # Гость — что-то между телефоном и скобкой
+    guest = None
+    if phone:
+        after_phone = text[text.rfind(phone) + len(phone):]
+        # убираем разделители, скобку
+        after = re.sub(r"\(.*?\)", "", after_phone)
+        after = after.strip(" —-\t")
+        if after:
+            guest = after
+
+    return {
+        "amount": amount,
+        "payment": payment,
+        "is_tip": is_tip,
+        "materials": materials,
+        "phone": phone,
+        "guest": guest,
+        "photographer": photographer,
+        "raw": text.strip(),
+    }
+
+
+def collect_sales_from_events(chat_id_shifts: int, target_date: dt.date | None = None) -> list[dict]:
+    """Собирает все парсенные продажи из событий за день в Shifts-чате."""
+    if target_date is None:
+        target_date = dt.date.today()
+
+    events = load_events().get(str(chat_id_shifts), [])
+    # Dubai UTC+4 — день начинается в 16:00 UTC текущего дня
+    day_start = dt.datetime.combine(target_date, dt.time(16, 0), dt.timezone.utc)
+    day_end = day_start + dt.timedelta(hours=14)
+
+    sales = []
+    for e in events:
+        if e.get("type") != "sale_line":
+            continue
+        try:
+            t = dt.datetime.fromisoformat(e["time"])
+        except Exception:
+            continue
+        if not (day_start <= t <= day_end):
+            continue
+        parsed = parse_sale_line(e.get("caption") or "")
+        if parsed:
+            parsed["author"] = e.get("author")
+            sales.append(parsed)
+
+    return sales
+
+
+def find_shifts_chat_for_location(location: str) -> int | None:
+    """Ищет chat_id Shifts-темы для указанной точки."""
+    places = load_known_places()
+    for info in places.values():
+        if info.get("location") == location and info.get("topic_type") == "shifts":
+            return info["chat_id"]
+    return None
+
+
+def calc_totals_from_sales(sales: list[dict]) -> dict:
+    """Считает Total / Card / Cash / Tip по списку продаж."""
+    card = 0
+    cash = 0
+    tip = 0
+    for s in sales:
+        if s["is_tip"]:
+            tip += s["amount"]
+            continue
+        if s["payment"] == "card":
+            card += s["amount"]
+        elif s["payment"] == "cash":
+            cash += s["amount"]
+    return {
+        "total": card + cash,
+        "card": card,
+        "cash": cash,
+        "tip": tip,
+    }
+
+
+def collect_photographers_from_sales(sales: list[dict]) -> dict:
+    """Группирует продажи по фотографу. Возвращает {имя: сумма}."""
+    by_photog = {}
+    for s in sales:
+        if s["is_tip"]:
+            continue
+        photog = s.get("photographer")
+        if not photog:
+            continue
+        # Нормализуем имя
+        emp = find_employee_by_name(photog)
+        name = emp["name"] if emp else photog
+        by_photog[name] = by_photog.get(name, 0) + s["amount"]
+    return by_photog
+
+
+def calc_used_materials(sales: list[dict], defective: dict | None = None) -> dict:
+    """Считает использованные расходники из продаж + defective."""
+    used = {
+        "paper": 0,
+        "envelopes": 0,
+        "frame": 0,
+        "black_bags": 0,
+        "business_cards": 0,
+        "bc_envelopes": 0,
+    }
+    for s in sales:
+        if s["is_tip"]:
+            continue
+        m = s["materials"]
+        # Бумага = все распечатанные фото (w_f + frame)
+        printed = m["w_f"] + m["frame"]
+        used["paper"] += printed
+        # Конверты для w/f
+        used["envelopes"] += m["envelope"]
+        # Рамки
+        used["frame"] += m["frame"]
+        # Чёрные пакеты — идут с рамками
+        used["black_bags"] += m["bag"]
+        # Визитки
+        used["business_cards"] += m["business_card"]
+        # Конверты для визиток
+        used["bc_envelopes"] += m["bc_envelope"]
+
+    # Добавляем defective
+    if defective:
+        used["paper"] += defective.get("prints", 0)
+        used["envelopes"] += defective.get("envelopes", 0)
+        used["frame"] += defective.get("frames", 0)
+        used["black_bags"] += defective.get("bags", 0)
+
+    return used
+
+
+def calc_remaining_stock(location: str, sales: list[dict], defective: dict | None) -> dict | None:
+    """Рассчитывает текущий остаток: previous - used. Если нет previous — None."""
+    if not REMAINING_STOCK_FILE.exists():
+        return None
+    try:
+        data = json.loads(REMAINING_STOCK_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    prev = data.get(location, {}).get("stock")
+    if not prev:
+        return None
+
+    used = calc_used_materials(sales, defective)
+    new_stock = {}
+    for key in ["paper", "envelopes", "frame", "black_bags", "business_cards", "bc_envelopes"]:
+        new_stock[key] = max(0, prev.get(key, 0) - used.get(key, 0))
+    return new_stock
 
 
 async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -446,6 +1076,21 @@ async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines.append(f"• Group: {chat.title or '(без названия)'}")
     lines.append(f"• Распознал точку: **{location or 'не распознал'}**")
     lines.append(f"• Распознал тему: **{topic_type or 'не распознал (или основной чат)'}**")
+
+    # Если это Shifts-тема известной точки — запланировать проверку принтеров
+    if topic_type == "shifts" and location in SHIFT_START_HOURS:
+        try:
+            schedule_printers_check(
+                context.application,
+                chat_id=chat.id,
+                location=location,
+                thread_id=msg.message_thread_id if msg.is_topic_message else None,
+            )
+            start_h = SHIFT_START_HOURS[location]
+            lines.append(f"• Проверка принтеров: ежедневно в {start_h:02d}:{PRINTERS_DEADLINE_MINUTES:02d}")
+        except Exception:
+            logger.exception("Не смог запланировать проверку")
+
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -636,7 +1281,7 @@ def format_final_report(data: dict) -> str:
     """Собирает финальный End of Shift Report БЕЗ пустых полей."""
     lines = []
     lines.append(f"📩 End of Shift Report {data['location']}")
-    lines.append(f"Date: {data['date'].strftime('%d-%m-%Y')}")
+    lines.append(f"Date: {data['date'].strftime('%d/%m/%Y')}")
     lines.append("")
     lines.append(f"💰 Total Revenue: {data['total']} AED")
     lines.append(f"Card: {data['card']} AED")
@@ -713,7 +1358,7 @@ def format_final_report(data: dict) -> str:
 
     # Sales Breakdown
     if data.get("sales_breakdown"):
-        lines.append("🧾 Sales Breakdown:")
+        lines.append("💰 Sales Breakdown:")
         lines.append(data["sales_breakdown"].strip())
         lines.append("")
 
@@ -760,8 +1405,9 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "date": dt.date.today(),
     }
 
+    greeting = random.choice(GREETINGS_REPORT_START).format(name=name)
     await update.effective_message.reply_text(
-        f"{name}, привет! 🌙 Закрываем смену.\n"
+        f"{greeting}\n"
         f"На какой точке сегодня была? Напиши название (например: Avenue).\n\n"
         f"Если передумала — /cancel"
     )
@@ -786,9 +1432,8 @@ async def on_location_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["report"]["location"] = location
 
     await update.effective_message.reply_text(
-        f"📍 Точка: *{location}*\n\n"
-        f"Кидай выручку одной строкой:\n"
-        f"`Total Card Cash`\n\n"
+        f"Точка: *{location}*\n\n"
+        f"Кидай выручку одной строкой: `Total Card Cash`\n"
         f"Например: `2300 2000 300`",
         parse_mode="Markdown",
     )
@@ -801,8 +1446,7 @@ async def on_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     parsed = parse_revenue_line(text)
     if not parsed:
         await update.effective_message.reply_text(
-            "Ты что-то пишешь неверно, проверь точно правильность суммы 🙏\n"
-            "Мне нужна общая сумма, потом сколько оплатили картой, потом наличными.\n\n"
+            "Что-то не так. Мне нужна общая сумма, потом сколько оплатили картой, потом наличными.\n\n"
             "Пример: `2300 2000 300` (Total 2300 = Card 2000 + Cash 300)",
             parse_mode="Markdown",
         )
@@ -813,10 +1457,14 @@ async def on_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["report"]["card"] = card
     context.user_data["report"]["cash"] = cash
 
+    # Имя текущего пользователя для примера чаевых
+    name_for_example = context.user_data["report"].get("name", "Anas")
+
     await update.effective_message.reply_text(
-        f"Записал ✍️ Касса {total} / Card {card} / Cash {cash}\n\n"
-        f"💸 Чаевые были? Кидай сумму и кому (например: `100 Polina`).\n"
-        f"Если нет — /skip"
+        f"Записал. Касса {total} / Card {card} / Cash {cash}\n\n"
+        f"Чаевые были? Кидай сумму и кому (например: `100 {name_for_example}` — 100 AED для {name_for_example}).\n"
+        f"Если нет — /skip",
+        parse_mode="Markdown",
     )
     return R_TIP
 
@@ -830,7 +1478,7 @@ async def on_tip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cash = context.user_data["report"].get("cash", 0)
     if cash > 0:
         await update.effective_message.reply_text(
-            f"💵 У кого остались наличные ({cash} AED) и сколько?\n"
+            f"У кого остались наличные ({cash} AED)?\n"
             f"Формат: `Anas 200, Mahir 100`\n"
             f"Если всё в одних руках — `Anas {cash}`",
             parse_mode="Markdown",
@@ -851,11 +1499,12 @@ async def on_cash_holding(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def ask_photographers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Спросить кто работал и сколько каждый сделал."""
+    quip = random.choice(SALARY_QUIPS)
     await update.effective_message.reply_text(
-        "👥 Кто работал и сколько каждый сделал?\n"
-        "Формат: `Имя сумма, Имя сумма`\n\n"
+        "Кто работал и сколько каждый сделал?\n"
+        "Формат: `Имя сумма, Имя сумма`\n"
         "Например: `Jennet 1500, Polina Kostyn 800`\n\n"
-        "Зарплаты сам посчитаю по ставкам из базы 💼",
+        f"{quip}",
         parse_mode="Markdown",
     )
     return R_PHOTOGRAPHERS
@@ -897,7 +1546,8 @@ async def on_photographers(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await update.effective_message.reply_text(
         f"Окей, зарплаты разложил 💼\n{salaries_block}\n\n"
-        f"🧾 Теперь кидай Sales Breakdown одним сообщением — как обычно постишь:\n\n"
+        f"💰 Теперь кидай Sales Breakdown одним сообщением — как обычно постишь.\n"
+        f"⚠️ Tip сюда не пиши — он уже отдельно зафиксирован.\n\n"
         f"Например:\n"
         f"1. 300 AED 💳 — 1 Frame, 1 Bag, 1 Business Card with Envelope — +971... — Имя гостя\n"
         f"2. 500 AED 💵 — 2 w/f, 2 Envelope, 2 Business Card with Envelope — +971... — Имя\n\n"
@@ -910,12 +1560,42 @@ async def on_sales_breakdown(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Sales Breakdown свободным текстом."""
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
+        # Если упомянут Tip — предупредить
+        if re.search(r"\btip\b|\bчаев", text, re.IGNORECASE):
+            await update.effective_message.reply_text(
+                "Вижу строку про Tip в Sales Breakdown — убери её, пожалуйста. "
+                "Tip уже зафиксирован отдельно, иначе будет удвоение в отчёте.\n\n"
+                "Пришли Sales Breakdown заново — только продажи фото."
+            )
+            return R_SALES_BREAKDOWN
         context.user_data["report"]["sales_breakdown"] = text
 
-    # TODO(автосбор): сеты должны браться из chat events, а не от пользователя.
-    # Когда сделаем — этот шаг убрать, сразу спрашивать Expenses.
+    # АВТОСБОР СЕТОВ из чата за сегодня
+    location = context.user_data["report"].get("location")
+    target_date = context.user_data["report"].get("date") or dt.date.today()
+    sets_collected = collect_sets_from_events(location, target_date) if location else []
+
+    if sets_collected:
+        # Формируем блок Photoshoot Sets автоматически
+        sets_lines = [f"Set {i+1}: {n}" for i, n in enumerate(sets_collected)]
+        total_pics = sum(sets_collected)
+        sets_text = "\n".join(sets_lines) + f"\nTotal Pics: {total_pics}"
+        context.user_data["report"]["photoshoot_sets"] = sets_text
+        context.user_data["report"]["sets_auto"] = True
+
+        await update.effective_message.reply_text(
+            f"Сеты собрал из чата за сегодня ({len(sets_collected)} шт, всего {total_pics} фото). "
+            f"Шаг пропускаю.\n\n"
+            f"Дальше — такси, было?\n"
+            f"Формат: `photographer 50, retoucher 40`\n"
+            f"Если такси не было — /skip",
+            parse_mode="Markdown",
+        )
+        return R_EXPENSES
+
+    # Если не нашёл сетов — спрашиваем как раньше
     await update.effective_message.reply_text(
-        "📸 Сеты как обычно одним сообщением:\n"
+        "Сеты не нашёл в чате. Кидай одним сообщением:\n"
         "Set 1: 11\n"
         "Set 2: 8\n"
         "Set 3: 12\n\n"
@@ -947,70 +1627,186 @@ async def on_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     await update.effective_message.reply_text(
         "🧾 Defective Materials — что забраковали?\n"
-        "Одной строкой 4 числа в порядке: `Prints, Envelopes, Frames, Bags`\n"
-        "Например: `58, 0, 1, 0`\n\n"
-        "Если ничего не забраковали — /skip"
+        "Пришли в столбик, каждое поле с новой строки:\n\n"
+        "```\n"
+        "Prints: 58\n"
+        "Envelopes: 0\n"
+        "Frames: 1\n"
+        "Bags: 0\n"
+        "```\n\n"
+        "Если ничего не забраковали — /skip",
+        parse_mode="Markdown",
     )
     return R_DEFECTIVE
 
 
 async def on_defective(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Defective Materials — 4 числа одной строкой."""
+    """Defective Materials — формат `Label: число` по строкам."""
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
-        nums = [n.strip() for n in re.split(r"[,;\s]+", text) if n.strip()]
-        if len(nums) != 4 or not all(n.isdigit() for n in nums):
+        result = parse_labeled_lines(text, expected_labels=["prints", "envelopes", "frames", "bags"])
+        if result is None:
             await update.effective_message.reply_text(
-                "Не понял. Нужно 4 числа через запятую или пробел.\n"
-                "Порядок: `Prints, Envelopes, Frames, Bags`\n"
-                "Пример: `58, 0, 1, 0`\n\n"
-                "Или /skip"
+                "Не понял. Нужно 4 строки в формате `Label: число`:\n\n"
+                "```\n"
+                "Prints: 58\n"
+                "Envelopes: 0\n"
+                "Frames: 1\n"
+                "Bags: 0\n"
+                "```\n\n"
+                "Или /skip",
+                parse_mode="Markdown",
             )
             return R_DEFECTIVE
-        context.user_data["report"]["defective"] = {
-            "prints": int(nums[0]),
-            "envelopes": int(nums[1]),
-            "frames": int(nums[2]),
-            "bags": int(nums[3]),
-        }
+        context.user_data["report"]["defective"] = result
 
     await update.effective_message.reply_text(
         "📦 Remaining Consumables — сколько осталось?\n"
-        "Одной строкой 6 чисел в порядке:\n"
-        "`Paper, Envelopes, Frame, Black Bags, Business Cards, BC Envelopes`\n\n"
-        "Например: `4770, 280, 19, 54, 83, 764`\n\n"
-        "Если не считали — /skip"
+        "Пришли в столбик, каждое поле с новой строки:\n\n"
+        "```\n"
+        "Paper: 4770\n"
+        "Envelopes: 280\n"
+        "Frame: 19\n"
+        "Black Bags: 54\n"
+        "Business Cards: 83\n"
+        "BC Envelopes: 764\n"
+        "```\n\n"
+        "Если не считали — /skip",
+        parse_mode="Markdown",
     )
     return R_REMAINING
 
 
 async def on_remaining(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Remaining Consumables — 6 чисел одной строкой."""
+    """Remaining Consumables — формат `Label: число` по строкам."""
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
-        nums = [n.strip() for n in re.split(r"[,;\s]+", text) if n.strip()]
-        if len(nums) != 6 or not all(n.isdigit() for n in nums):
+        result = parse_labeled_lines(
+            text,
+            expected_labels=["paper", "envelopes", "frame", "black bags", "business cards", "bc envelopes"],
+        )
+        if result is None:
             await update.effective_message.reply_text(
-                "Не понял. Нужно 6 чисел через запятую или пробел.\n"
-                "Порядок: `Paper, Envelopes, Frame, Black Bags, Business Cards, BC Envelopes`\n"
-                "Пример: `4770, 280, 19, 54, 83, 764`\n\n"
-                "Или /skip"
+                "Не понял. Нужно 6 строк в формате `Label: число`:\n\n"
+                "```\n"
+                "Paper: 4770\n"
+                "Envelopes: 280\n"
+                "Frame: 19\n"
+                "Black Bags: 54\n"
+                "Business Cards: 83\n"
+                "BC Envelopes: 764\n"
+                "```\n\n"
+                "Или /skip",
+                parse_mode="Markdown",
             )
             return R_REMAINING
-        context.user_data["report"]["remaining"] = {
-            "paper": int(nums[0]),
-            "envelopes": int(nums[1]),
-            "frame": int(nums[2]),
-            "black_bags": int(nums[3]),
-            "business_cards": int(nums[4]),
-            "bc_envelopes": int(nums[5]),
-        }
+        context.user_data["report"]["remaining"] = result
+
+        # Сохраняем как актуальные остатки для этой точки и проверяем пороги
+        location = context.user_data["report"].get("location")
+        if location:
+            save_remaining_stock(location, result)
+            low = detect_low_stock(result)
+            if low:
+                warning = format_low_stock_warning(location, low)
+                # Предупреждение Sabin'е (она запускает /report)
+                await update.effective_message.reply_text(warning)
 
     await update.effective_message.reply_text(
         "🔗 Кидай ссылки на отснятое — Pixieset / Drive (одним сообщением).\n"
         "Если их нет — /skip"
     )
     return R_LINKS
+
+
+REMAINING_STOCK_FILE = Path("remaining_stock.json")
+
+# Минимальные запасы — ниже = предупреждение
+LOW_STOCK_THRESHOLDS = {
+    "paper": 200,
+    "envelopes": 50,
+    "frame": 10,
+    "black_bags": 20,
+    "business_cards": 30,
+    "bc_envelopes": 100,
+}
+
+STOCK_LABEL_NAMES = {
+    "paper": "A4 Paper",
+    "envelopes": "A4 Envelopes",
+    "frame": "A4 Frames",
+    "black_bags": "A4 Black Bags",
+    "business_cards": "Business Cards",
+    "bc_envelopes": "Business Card Envelopes",
+}
+
+
+def save_remaining_stock(location: str, stock: dict) -> None:
+    """Сохраняет текущие остатки расходников по точке."""
+    try:
+        data = {}
+        if REMAINING_STOCK_FILE.exists():
+            try:
+                data = json.loads(REMAINING_STOCK_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data[location] = {
+            "stock": stock,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        REMAINING_STOCK_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Не смог сохранить remaining_stock")
+
+
+def detect_low_stock(stock: dict) -> list[tuple[str, int, int]]:
+    """Возвращает список (key, value, threshold) для позиций ниже порога."""
+    low = []
+    for key, threshold in LOW_STOCK_THRESHOLDS.items():
+        value = stock.get(key)
+        if value is not None and value < threshold:
+            low.append((key, value, threshold))
+    return low
+
+
+def format_low_stock_warning(location: str, low_items: list) -> str:
+    """Формирует текст предупреждения о низких остатках."""
+    lines = [f"⚠️ На {location} заканчиваются расходники:"]
+    for key, value, threshold in low_items:
+        label = STOCK_LABEL_NAMES.get(key, key)
+        lines.append(f"• {label}: {value} (порог {threshold})")
+    lines.append("\nНадо подвезти.")
+    return "\n".join(lines)
+
+
+def parse_labeled_lines(text: str, expected_labels: list[str]) -> dict | None:
+    """Парсит ввод вида `Label: число` по строкам.
+    Возвращает {normalized_label: int} или None если не нашлось всех ожидаемых.
+    Сортирует лейблы по длине (длинные первыми), чтобы 'BC Envelopes' не матчилось как 'Envelopes'."""
+    # Длинные лейблы — первыми, для приоритета при матчинге
+    sorted_labels = sorted(expected_labels, key=len, reverse=True)
+
+    result = {}
+    used_labels = set()
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^([A-Za-zА-Яа-я\s]+?)[:\s]+(\d+)\s*(?:pcs|шт)?\s*$", line, re.IGNORECASE)
+        if not m:
+            continue
+        label = m.group(1).strip().lower()
+        for expected in sorted_labels:
+            if expected in used_labels:
+                continue
+            if label == expected.lower():
+                key = expected.lower().replace(" ", "_")
+                result[key] = int(m.group(2))
+                used_labels.add(expected)
+                break
+    if len(result) != len(expected_labels):
+        return None
+    return result
 
 
 async def on_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1097,6 +1893,367 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Команда /cancel для выхода из диалога."""
     context.user_data.pop("report", None)
+    context.user_data.pop("close", None)
+    await update.effective_message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────
+# КОМАНДА /close — автосбор отчёта в Cash Report
+# ──────────────────────────────────────────────
+
+# Состояния диалога /close
+(
+    C_TIP,
+    C_CASH_HOLDING,
+    C_EXPENSES,
+    C_DEFECTIVE,
+    C_CONFIRM,
+) = range(100, 105)  # отдельный диапазон чтобы не пересекаться с R_*
+
+
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Запуск автосбора отчёта в Cash Report."""
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return ConversationHandler.END
+
+    # Только в группах
+    if chat.type == "private":
+        await msg.reply_text(
+            "Эту команду используй в теме Cash Report твоей точки. "
+            "В личке используй /report."
+        )
+        return ConversationHandler.END
+
+    # Только для авторизованных
+    emp = get_employee_info(user.username)
+    if not emp:
+        if user:
+            log_unauthorized_access(user)
+        await msg.reply_text(
+            "У тебя нет доступа к этой команде. "
+            "Если ты в команде Marsa Moments — обратись к Сабине."
+        )
+        return ConversationHandler.END
+
+    # Определяем точку и тип темы
+    location, topic_type = recognize_place(update)
+    if topic_type != "cash_report":
+        await msg.reply_text(
+            "Эту команду нужно запускать в теме *Cash Report* твоей точки.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    if not location:
+        await msg.reply_text(
+            "Не понял какая это точка. Напиши /whereami здесь и в Shifts-теме."
+        )
+        return ConversationHandler.END
+
+    # Ищем Shifts-чат этой точки
+    shifts_chat_id = find_shifts_chat_for_location(location)
+    if not shifts_chat_id:
+        await msg.reply_text(
+            f"Я пока не знаю Shifts-тему *{location}*. "
+            f"Зайди в неё и напиши `/whereami` — тогда смогу собирать данные.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    # СОБИРАЕМ ДАННЫЕ ЗА ДЕНЬ
+    today = dt.date.today()
+    sales = collect_sales_from_events(shifts_chat_id, today)
+    sets_collected = collect_sets_from_events(location, today)
+    totals = calc_totals_from_sales(sales)
+    photographers = collect_photographers_from_sales(sales)
+
+    name = emp["name"]
+    context.user_data["close"] = {
+        "name": name,
+        "username": user.username,
+        "user_id": user.id,
+        "chat_id": chat.id,
+        "thread_id": msg.message_thread_id if msg.is_topic_message else None,
+        "location": location,
+        "shifts_chat_id": shifts_chat_id,
+        "date": today,
+        "sales": sales,
+        "sets": sets_collected,
+        "totals": totals,
+        "photographers": photographers,
+    }
+
+    # Показываем что собрали
+    lines = [f"📊 Собрал данные за день — {location}, {today.strftime('%d/%m/%Y')}:\n"]
+
+    if totals["total"] > 0:
+        lines.append(f"💰 Total: {totals['total']} AED (Card {totals['card']} / Cash {totals['cash']})")
+        if totals["tip"]:
+            lines.append(f"💸 Tip: {totals['tip']} AED")
+    else:
+        lines.append("⚠️ Продаж в чате не нашёл за сегодня.")
+
+    if sets_collected:
+        lines.append(f"📸 Сеты: {len(sets_collected)} шт ({sum(sets_collected)} фото всего)")
+    else:
+        lines.append("⚠️ Сеты не собрал — никто не постил.")
+
+    if photographers:
+        ph_str = ", ".join(f"{n}: {s} AED" for n, s in photographers.items())
+        lines.append(f"👥 Работали: {ph_str}")
+
+    lines.append("")
+    lines.append("Дальше уточню что не знаю. Можно /cancel.")
+    await msg.reply_text("\n".join(lines))
+
+    # Спрашиваем чаевые если не нашёл
+    if totals["tip"] == 0:
+        await msg.reply_text(
+            f"💸 Чаевые были? Кидай сумму и кому (например: `100 {name}`).\n"
+            f"Если нет — /skip",
+            parse_mode="Markdown",
+        )
+        return C_TIP
+    else:
+        # Tip уже знаем — идём к Cash Holding
+        return await close_step_cash_holding(update, context)
+
+
+async def on_close_tip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["close"]["tip_manual"] = text
+    return await close_step_cash_holding(update, context)
+
+
+async def close_step_cash_holding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    data = context.user_data["close"]
+    cash = data["totals"]["cash"]
+    if cash > 0:
+        await update.effective_message.reply_text(
+            f"💵 У кого остались наличные ({cash} AED)?\n"
+            f"Формат: `Anas 200, Mahir 100`. Если всё в одних руках — `Anas {cash}`",
+            parse_mode="Markdown",
+        )
+        return C_CASH_HOLDING
+    return await close_step_expenses(update, context)
+
+
+async def on_close_cash_holding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["close"]["cash_holding"] = text
+    return await close_step_expenses(update, context)
+
+
+async def close_step_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.effective_message.reply_text(
+        "💸 Такси было?\n"
+        "Формат: `photographer 50, retoucher 40`. Если не было — /skip",
+        parse_mode="Markdown",
+    )
+    return C_EXPENSES
+
+
+async def on_close_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        context.user_data["close"]["expenses"] = text
+    return await close_step_defective(update, context)
+
+
+async def close_step_defective(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.effective_message.reply_text(
+        "🧾 Defective Materials — что забраковали?\n"
+        "Пришли в столбик:\n\n"
+        "```\n"
+        "Prints: 58\n"
+        "Envelopes: 0\n"
+        "Frames: 1\n"
+        "Bags: 0\n"
+        "```\n\n"
+        "Если ничего — /skip",
+        parse_mode="Markdown",
+    )
+    return C_DEFECTIVE
+
+
+async def on_close_defective(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()
+    if text and text != "/skip":
+        result = parse_labeled_lines(text, expected_labels=["prints", "envelopes", "frames", "bags"])
+        if result is None:
+            await update.effective_message.reply_text(
+                "Не понял. Нужно 4 строки `Label: число` или /skip"
+            )
+            return C_DEFECTIVE
+        context.user_data["close"]["defective"] = result
+
+    # Рассчитываем Remaining автоматически
+    data = context.user_data["close"]
+    remaining = calc_remaining_stock(data["location"], data["sales"], data.get("defective"))
+    data["remaining"] = remaining
+
+    # Показываем черновик финального отчёта
+    draft = format_close_report(data)
+    await update.effective_message.reply_text(
+        f"Готовый отчёт:\n\n```\n{draft}\n```\n\n"
+        f"Публиковать? Напиши `да` или `нет`.",
+        parse_mode="Markdown",
+    )
+    return C_CONFIRM
+
+
+async def on_close_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip().lower()
+    if text in ("нет", "no", "n", "отмена"):
+        await update.effective_message.reply_text("Окей, отбой. Когда будешь готов(а) — /close ещё раз.")
+        context.user_data.pop("close", None)
+        return ConversationHandler.END
+
+    if text not in ("да", "yes", "y", "+", "ок", "ok", "опубликовать"):
+        await update.effective_message.reply_text("Напиши `да` или `нет`.")
+        return C_CONFIRM
+
+    data = context.user_data["close"]
+    final_text = format_close_report(data)
+
+    # Публикуем В ТУ ЖЕ ТЕМУ откуда запустили
+    try:
+        await context.bot.send_message(
+            chat_id=data["chat_id"],
+            text=final_text,
+            message_thread_id=data.get("thread_id"),
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(
+            f"⚠️ Не получилось опубликовать ({e}).\nВот текст:\n\n```\n{final_text}\n```",
+            parse_mode="Markdown",
+        )
+        context.user_data.pop("close", None)
+        return ConversationHandler.END
+
+    # Сохраняем новый остаток
+    if data.get("remaining"):
+        save_remaining_stock(data["location"], data["remaining"])
+
+    await update.effective_message.reply_text("Опубликовал. Хорошей ночи 🌙")
+    context.user_data.pop("close", None)
+    return ConversationHandler.END
+
+
+def format_close_report(data: dict) -> str:
+    """Формирует End of Shift Report из собранных данных."""
+    lines = []
+    lines.append(f"📩 End of Shift Report {data['location']}")
+    lines.append(f"Date: {data['date'].strftime('%d/%m/%Y')}")
+    lines.append("")
+
+    t = data["totals"]
+    lines.append(f"💰 Total Revenue: {t['total']} AED")
+    lines.append(f"Card: {t['card']} AED")
+    lines.append(f"Cash: {t['cash']} AED")
+    tip_value = t["tip"] if t["tip"] else data.get("tip_manual")
+    if tip_value:
+        lines.append(f"Tip: {tip_value}")
+    lines.append("")
+
+    # Cash Holding
+    if data.get("cash_holding"):
+        lines.append("💵 Cash Holding:")
+        for h in re.split(r"[,;\n]", data["cash_holding"]):
+            h = h.strip()
+            if not h:
+                continue
+            m = re.match(r"^(.+?)\s+(\d+)$", h)
+            if m:
+                lines.append(f"Cash With {m.group(1).strip()}: {m.group(2)} AED")
+            else:
+                lines.append(f"Cash With {h}")
+        lines.append("")
+
+    # Individual Sales и Salaries
+    photogs = data.get("photographers", {})
+    if len(photogs) >= 2:
+        lines.append("👥 Individual Sales:")
+        for n, s in photogs.items():
+            lines.append(f"Photographer {n}: {s} AED")
+        lines.append("")
+    if photogs:
+        lines.append("💼 Salaries:")
+        for n, s in photogs.items():
+            emp = find_employee_by_name(n)
+            rate = emp.get("rate") if emp else None
+            if rate:
+                lines.append(f"Photographer {n}: {int(round(s * rate))} AED")
+        lines.append("")
+
+    # Expenses
+    if data.get("expenses"):
+        lines.append("💸 Expenses:")
+        for part in re.split(r"[,;\n]", data["expenses"]):
+            part = part.strip().lower()
+            if not part:
+                continue
+            m = re.match(r"^(photographer|retoucher)\s+(\d+)$", part)
+            if m:
+                role = "Photographer" if m.group(1) == "photographer" else "Retoucher"
+                lines.append(f"• {role} Taxi: {m.group(2)} AED")
+        lines.append("")
+
+    # Defective Materials
+    if data.get("defective"):
+        d = data["defective"]
+        lines.append("🧾 Defective Materials:")
+        lines.append(f"• A4 Prints: {d['prints']} pcs")
+        lines.append(f"• A4 Envelopes: {d['envelopes']} pcs")
+        lines.append(f"• A4 Frames: {d['frames']} pcs")
+        lines.append(f"• A4 Bags: {d['bags']} pcs")
+        lines.append("")
+
+    # Remaining (расчётный)
+    if data.get("remaining"):
+        r = data["remaining"]
+        lines.append("📦 Remaining Consumables:")
+        lines.append(f"• A4 Paper: {r['paper']} pcs")
+        lines.append(f"• A4 Envelopes: {r['envelopes']} pcs")
+        lines.append(f"• A4 Frame: {r['frame']} pcs")
+        lines.append(f"• A4 Black Bags: {r['black_bags']} pcs")
+        lines.append(f"• Business Cards: {r['business_cards']} pcs")
+        lines.append(f"• Business Card Envelopes: {r['bc_envelopes']} pcs")
+        lines.append("")
+
+    # Sales Breakdown — из собранных строк
+    sales = data.get("sales", [])
+    sales_no_tips = [s for s in sales if not s["is_tip"]]
+    if sales_no_tips:
+        lines.append("💰 Sales Breakdown:")
+        for i, s in enumerate(sales_no_tips, 1):
+            lines.append(f"{i}. {s['raw']}")
+        lines.append("")
+
+    # Photoshoot Sets
+    sets = data.get("sets", [])
+    if sets:
+        lines.append("📸 Photoshoot Sets:")
+        for i, n in enumerate(sets, 1):
+            lines.append(f"Set {i}: {n}")
+        lines.append(f"Total Pics: {sum(sets)}")
+
+    return "\n".join(lines).strip()
+
+
+async def cmd_close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена /close — только тот кто запустил."""
+    user = update.effective_user
+    data = context.user_data.get("close")
+    if not data or not user or data.get("user_id") != user.id:
+        return ConversationHandler.END
+    context.user_data.pop("close", None)
     await update.effective_message.reply_text("Отменено.")
     return ConversationHandler.END
 
@@ -1115,10 +2272,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = emp["name"] if emp else (user.first_name or "там")
 
     if emp:
+        greeting = random.choice(GREETINGS_START).format(name=name)
         await update.effective_message.reply_text(
-            f"Привет, {name}! ✨\n"
-            f"На связи Марса — твой помощник по отчётам.\n"
-            f"Ну что, разгребаем смены? 💪\n\n"
+            f"{greeting}\n\n"
             f"/report — собрать End of Shift пошагово\n"
             f"/cancel — отменить если что"
         )
@@ -1189,12 +2345,47 @@ def main() -> None:
     )
     app.add_handler(report_conv)
 
+    # Диалог /close — в Cash Report групповых чатов
+    close_conv = ConversationHandler(
+        entry_points=[CommandHandler("close", cmd_close)],
+        states={
+            C_TIP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_close_tip),
+                CommandHandler("skip", on_close_tip),
+            ],
+            C_CASH_HOLDING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_close_cash_holding),
+                CommandHandler("skip", on_close_cash_holding),
+            ],
+            C_EXPENSES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_close_expenses),
+                CommandHandler("skip", on_close_expenses),
+            ],
+            C_DEFECTIVE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_close_defective),
+                CommandHandler("skip", on_close_defective),
+            ],
+            C_CONFIRM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_close_confirm),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_close_cancel)],
+        per_chat=False,
+    )
+    app.add_handler(close_conv)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whereami", cmd_whereami))
     app.add_handler(CommandHandler("locations", cmd_locations))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
+
+    # Планируем ежедневные проверки отчёта по принтерам для всех известных Shifts-тем
+    try:
+        schedule_all_printers_checks(app)
+    except Exception:
+        logger.exception("Не смог запланировать проверки принтеров при старте")
 
     logger.info("Марса запущена. Жду события смены...")
     app.run_polling()
