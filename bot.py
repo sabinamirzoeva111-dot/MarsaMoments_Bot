@@ -788,13 +788,12 @@ def schedule_all_printers_checks(app) -> None:
 
 
 def collect_sets_from_events(location: str, target_date: dt.date | None = None) -> list[int]:
-    """Собирает все сеты из событий за указанный день в Shifts-теме указанной точки.
-    Возвращает список размеров (порядок — по времени). Если ничего нет — пустой список."""
+    """Собирает все сеты из событий за указанную смену.
+    Окно: 20:00 Dubai (target_date) → 10:00 Dubai (target_date+1)."""
     if target_date is None:
         target_date = dt.date.today()
 
     places = load_known_places()
-    # Ищем Shifts-тему этой точки
     target_chat_ids = set()
     for info in places.values():
         if info.get("location") == location and info.get("topic_type") == "shifts":
@@ -804,10 +803,8 @@ def collect_sets_from_events(location: str, target_date: dt.date | None = None) 
         return []
 
     events = load_events()
-    # Дубай UTC+4 — день начинается в 20:00 UTC предыдущего дня
-    # Берём окно событий: с 16:00 UTC дня (≈20:00 Dubai) до +12 часов
-    day_start_local = dt.datetime.combine(target_date, dt.time(16, 0), dt.timezone.utc)
-    day_end_local = day_start_local + dt.timedelta(hours=14)  # до 06:00 UTC = 10:00 Dubai
+    day_start = dt.datetime.combine(target_date, dt.time(16, 0), dt.timezone.utc)
+    day_end = day_start + dt.timedelta(hours=14)
 
     sets_collected = []
     for chat_id in target_chat_ids:
@@ -818,7 +815,7 @@ def collect_sets_from_events(location: str, target_date: dt.date | None = None) 
                 t = dt.datetime.fromisoformat(e["time"])
             except Exception:
                 continue
-            if not (day_start_local <= t <= day_end_local):
+            if not (day_start <= t <= day_end):
                 continue
             caption = e.get("caption") or ""
             m = re.search(r"size=(\d+)", caption)
@@ -932,13 +929,41 @@ def parse_sale_line(text: str) -> dict | None:
     }
 
 
+def split_sales_breakdown(text: str) -> list[str]:
+    """Разбивает большой блок Sales Breakdown на отдельные строки-продажи.
+    Каждая строка-продажа содержит AED + иконку (💳 или 💵)."""
+    lines = []
+    current = None
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if current:
+                lines.append(current)
+                current = None
+            continue
+        # Это начало новой строки продажи?
+        # Признаки: содержит "AED" и иконку
+        if re.search(r"\d+\s*AED", line, re.IGNORECASE) and ("💳" in line or "💵" in line):
+            if current:
+                lines.append(current)
+            current = line
+        elif current:
+            # Продолжение предыдущей строки (перенос)
+            current += " " + line
+    if current:
+        lines.append(current)
+    return lines
+
+
 def collect_sales_from_events(chat_id_shifts: int, target_date: dt.date | None = None) -> list[dict]:
-    """Собирает все парсенные продажи из событий за день в Shifts-чате."""
+    """Собирает все парсенные продажи из событий за день в Shifts-чате.
+    Разбивает многострочные сообщения на отдельные продажи."""
     if target_date is None:
         target_date = dt.date.today()
 
     events = load_events().get(str(chat_id_shifts), [])
-    # Dubai UTC+4 — день начинается в 16:00 UTC текущего дня
+    # Окно ночной смены: 20:00 Dubai (target_date) → 10:00 Dubai (target_date+1)
+    # = 16:00 UTC target_date → 06:00 UTC (target_date+1)
     day_start = dt.datetime.combine(target_date, dt.time(16, 0), dt.timezone.utc)
     day_end = day_start + dt.timedelta(hours=14)
 
@@ -952,12 +977,29 @@ def collect_sales_from_events(chat_id_shifts: int, target_date: dt.date | None =
             continue
         if not (day_start <= t <= day_end):
             continue
-        parsed = parse_sale_line(e.get("caption") or "")
-        if parsed:
-            parsed["author"] = e.get("author")
-            sales.append(parsed)
+        raw = e.get("caption") or ""
+        # Разбиваем многострочный текст на отдельные продажи
+        per_line = split_sales_breakdown(raw)
+        if not per_line:
+            # Может быть одна строка без переноса
+            per_line = [raw]
+        for line in per_line:
+            parsed = parse_sale_line(line)
+            if parsed:
+                parsed["author"] = e.get("author")
+                sales.append(parsed)
 
     return sales
+
+
+def smart_shift_date() -> dt.date:
+    """Возвращает дату смены. Если сейчас раннее утро Дубая (до 12:00) —
+    это закрытие ночной смены, дата смены = вчера. Иначе сегодня."""
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    now_dubai = now_utc + dt.timedelta(hours=4)
+    if now_dubai.hour < 12:
+        return (now_dubai - dt.timedelta(days=1)).date()
+    return now_dubai.date()
 
 
 def find_shifts_chat_for_location(location: str) -> int | None:
@@ -1964,10 +2006,10 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    # СОБИРАЕМ ДАННЫЕ ЗА ДЕНЬ
-    today = dt.date.today()
-    sales = collect_sales_from_events(shifts_chat_id, today)
-    sets_collected = collect_sets_from_events(location, today)
+    # СОБИРАЕМ ДАННЫЕ ЗА СМЕНУ (с учётом ночной смены)
+    target_date = smart_shift_date()
+    sales = collect_sales_from_events(shifts_chat_id, target_date)
+    sets_collected = collect_sets_from_events(location, target_date)
     totals = calc_totals_from_sales(sales)
     photographers = collect_photographers_from_sales(sales)
 
@@ -1980,7 +2022,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "thread_id": msg.message_thread_id if msg.is_topic_message else None,
         "location": location,
         "shifts_chat_id": shifts_chat_id,
-        "date": today,
+        "date": target_date,
         "sales": sales,
         "sets": sets_collected,
         "totals": totals,
@@ -1988,7 +2030,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     }
 
     # Показываем что собрали
-    lines = [f"📊 Собрал данные за день — {location}, {today.strftime('%d/%m/%Y')}:\n"]
+    lines = [f"📊 Собрал данные за смену — {location}, {target_date.strftime('%d/%m/%Y')}:\n"]
 
     if totals["total"] > 0:
         lines.append(f"💰 Total: {totals['total']} AED (Card {totals['card']} / Cash {totals['cash']})")
@@ -2024,6 +2066,8 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_close_tip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await maybe_handle_verdict_reply(update, context):
+        return C_TIP
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
         context.user_data["close"]["tip_manual"] = text
@@ -2044,8 +2088,16 @@ async def close_step_cash_holding(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def on_close_cash_holding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await maybe_handle_verdict_reply(update, context):
+        return C_CASH_HOLDING
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
+        if not re.search(r"\d", text):
+            await update.effective_message.reply_text(
+                "Не понял. Нужно имя и сумма, например `Anas 200` или `Anas 100, Mahir 200`.\n"
+                "Если наличных ни у кого нет — /skip"
+            )
+            return C_CASH_HOLDING
         context.user_data["close"]["cash_holding"] = text
     return await close_step_expenses(update, context)
 
@@ -2060,6 +2112,8 @@ async def close_step_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def on_close_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await maybe_handle_verdict_reply(update, context):
+        return C_EXPENSES
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
         context.user_data["close"]["expenses"] = text
@@ -2083,6 +2137,8 @@ async def close_step_defective(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def on_close_defective(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await maybe_handle_verdict_reply(update, context):
+        return C_DEFECTIVE
     text = (update.effective_message.text or "").strip()
     if text and text != "/skip":
         result = parse_labeled_lines(text, expected_labels=["prints", "envelopes", "frames", "bags"])
@@ -2109,6 +2165,8 @@ async def on_close_defective(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def on_close_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await maybe_handle_verdict_reply(update, context):
+        return C_CONFIRM
     text = (update.effective_message.text or "").strip().lower()
     if text in ("нет", "no", "n", "отмена"):
         await update.effective_message.reply_text("Окей, отбой. Когда будешь готов(а) — /close ещё раз.")
@@ -2258,6 +2316,30 @@ async def cmd_close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 
+def is_reply_to_verdict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True если сообщение — reply на бот-сообщение с вердиктом/ошибками отчёта,
+    а не на текущий вопрос диалога."""
+    msg = update.effective_message
+    if not msg or not msg.reply_to_message:
+        return False
+    if not msg.reply_to_message.from_user:
+        return False
+    if msg.reply_to_message.from_user.id != context.bot.id:
+        return False
+    replied_text = msg.reply_to_message.text or ""
+    markers = ["Нашёл проблем", "Found", "Отчёт чистый", "Сегодня ", "Касса ", "Проверь", "Sales Breakdown"]
+    return any(m in replied_text for m in markers)
+
+
+async def maybe_handle_verdict_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Если это reply на старое бот-сообщение с вердиктом — обработать как объяснение.
+    Возвращает True если обработано (нужно остаться в текущем шаге)."""
+    if not is_reply_to_verdict(update, context):
+        return False
+    await handle_explanation_reply(update, context)
+    return True
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Приветствие в личке с ботом — только для своих."""
     chat = update.effective_chat
@@ -2347,7 +2429,10 @@ def main() -> None:
 
     # Диалог /close — в Cash Report групповых чатов
     close_conv = ConversationHandler(
-        entry_points=[CommandHandler("close", cmd_close)],
+        entry_points=[
+            CommandHandler("close", cmd_close),
+            CommandHandler("endofshiftreport", cmd_close),
+        ],
         states={
             C_TIP: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_close_tip),
