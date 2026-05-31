@@ -444,17 +444,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if topic_type == "instructions":
         return
 
-    # Активный /sale у этого юзера? Обрабатываем ввод
-    if await on_sale_text_input(update, context):
-        return
-
     text = msg.text
 
-    # Детект Shift Report (открытие смены) — сохраняем как событие
+    # Детект Shift Report (открытие смены) — отдельная проверка структуры
     if is_shift_report_open(text):
         chat_id = update.effective_chat.id if update.effective_chat else 0
         if chat_id:
-            add_event(chat_id, "shift_report_open", text[:200], author_of(update))
+            add_event(chat_id, "shift_report_open", text[:500], author_of(update))
+        verdict = check_shift_report_structure(text, location)
+        if verdict is None:
+            # Всё чисто — реакция
+            await react_clean(context, chat_id, msg.message_id)
+        else:
+            await msg.reply_text(verdict)
+        return
 
     # Детект строк Sales Breakdown по ходу смены (с иконкой 💳 или 💵)
     if is_sale_line(text):
@@ -466,53 +469,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if msg.reply_to_message and msg.reply_to_message.from_user:
         bot_id = context.bot.id
         if msg.reply_to_message.from_user.id == bot_id:
-            # Человек отвечает на сообщение Марсы — это объяснение
             await handle_explanation_reply(update, context)
             return
 
     # 1. Это сет? — реагируем мгновенно, без Claude
     n = detect_set_size(text)
     if n is not None:
-        # Сохраняем сет как событие для автосбора в /report
         chat_id = update.effective_chat.id if update.effective_chat else 0
         if chat_id:
             add_event(chat_id, "set", f"size={n}", author_of(update))
         if n < SET_MIN_PHOTOS:
             await msg.reply_text(make_set_reminder(n))
-        return  # сет обработан, дальше не идём
+        return
 
     # 2. Это отчёт?
     if looks_like_report(text):
         chat_id = update.effective_chat.id if update.effective_chat else 0
 
-        # Сначала пробуем детерминированную проверку (быстро, стабильно)
         verdict = deterministic_sales_breakdown_check(text)
         if verdict is None:
-            # Не подходит для детерминированной — спрашиваем Claude
             logger.info("Получен отчёт, отправляю на проверку Claude...")
             verdict = check_report(text, chat_id)
         else:
             logger.info("Детерминированная проверка Sales Breakdown")
 
         save_last_report(update.effective_chat.id, text, verdict)
-        # Если отчёт чистый — только лайк, никакого текста
         if is_clean_verdict(verdict):
-            try:
-                await context.bot.set_message_reaction(
-                    chat_id=chat_id,
-                    message_id=msg.message_id,
-                    reaction="👍",
-                )
-            except Exception:
-                logger.exception("Не смог поставить реакцию на чистый отчёт")
-                try:
-                    await msg.reply_text("👍")
-                except Exception:
-                    pass
+            await react_clean(context, chat_id, msg.message_id)
         else:
             await msg.reply_text(verdict)
         return
-
 
 def is_clean_verdict(verdict: str) -> bool:
     """Определяет, чистый ли отчёт по вердикту."""
@@ -636,8 +622,7 @@ def make_set_reminder(n: int) -> str:
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает фото. Если у фото есть подпись и она похожа на сет —
-    проверяем размер и при необходимости пишем напоминание."""
+    """Обрабатывает фото. Если в Shifts фото принтера — запускает vision-проверку."""
     msg = update.effective_message
     if msg is None or not msg.photo:
         return
@@ -648,12 +633,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Запоминаем место
     location, topic_type = recognize_place(update)
 
-    # В Instructions & Reminders — молчим (но событие сохраняем)
+    # В Instructions & Reminders — молчим
     silent = (topic_type == "instructions")
 
     caption = msg.caption
     add_event(chat.id, "photo", caption, author_of(update))
-    # Сохраняем артефакт закрытия смены отдельным событием для проверки
     artifact = detect_shift_close_artifact(caption)
     if artifact:
         add_event(chat.id, f"artifact_{artifact}", caption, author_of(update))
@@ -662,12 +646,109 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if silent:
         return
 
-    # Если в подписи распознался сет — проверяем размер и сохраняем
+    # Если подпись распознана как сет — обработать
     n = detect_set_size(caption)
     if n is not None:
         add_event(chat.id, "set", f"size={n}", author_of(update))
         if n < SET_MIN_PHOTOS:
             await msg.reply_text(make_set_reminder(n))
+        return
+
+    # Vision-проверка принтера: если в Shifts и подпись намекает на принтер
+    if topic_type == "shifts" and artifact == "printer":
+        await check_printer_photo_with_vision(update, context, location)
+        return
+
+
+PRINTER_INK_KEYWORDS_HINT = ["L8050", "EcoTank", "Epson"]
+
+
+async def check_printer_photo_with_vision(update: Update, context: ContextTypes.DEFAULT_TYPE, location: str | None) -> None:
+    """Через Claude Vision проверяет: на фото принтер(ы), видны ли баки с чернилами, и в них есть чернила."""
+    msg = update.effective_message
+    if not msg or not msg.photo:
+        return
+    chat = update.effective_chat
+
+    try:
+        # Берём самое крупное фото
+        photo = msg.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        # Скачиваем во временный файл
+        import tempfile, base64
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            tmp_path = f.name
+        await file.download_to_drive(tmp_path)
+        with open(tmp_path, "rb") as f:
+            img_bytes = f.read()
+        img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
+
+        # Эталон принтеров для этой точки
+        expected_count = PRINTER_COUNT_BY_LOCATION.get(location or "") if location else None
+        expected_hint = f"\nExpected printer count for this location: {expected_count}." if expected_count else ""
+
+        prompt = (
+            "На фото — фото принтера(ов) для отчёта о начале смены в Marsa Moments.\n"
+            "Оцени:\n"
+            "1. Сколько принтеров видно на фото? Это Epson EcoTank L8050.\n"
+            "2. Видны ли прозрачные баки с чернилами на принтерах?\n"
+            "3. По каждому видимому баку: уровень чернил выше 50%, 25-50%, или ниже 25%?\n"
+            f"{expected_hint}\n\n"
+            "Ответ строго в JSON:\n"
+            "{\n"
+            '  "printers_visible": <число>,\n'
+            '  "tanks_visible": <true/false>,\n'
+            '  "low_ink": <true/false>,  // если хоть один бак ниже 25%\n'
+            '  "comment": "<краткое наблюдение, 1 строка>"\n'
+            "}\n"
+            "Никакого текста кроме JSON."
+        )
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        raw = response.content[0].text.strip()
+        # Чистим возможные тройные кавычки
+        raw_clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+        result = json.loads(raw_clean)
+
+        issues = []
+        if expected_count and result.get("printers_visible", 0) < expected_count:
+            issues.append(
+                f"• На фото видно {result.get('printers_visible')} принтер(ов), "
+                f"а для {location} должно быть {expected_count}. Сделай общее фото где видно все."
+            )
+        if not result.get("tanks_visible"):
+            issues.append("• Баки с чернилами не видны. Сделай фото так чтобы баки были в кадре.")
+        if result.get("low_ink"):
+            issues.append("• Уровень чернил в одном из баков низкий — пора заправлять.")
+
+        if not issues:
+            # Всё ок — реакция
+            await react_clean(context, chat.id, msg.message_id)
+            # Сохраняем подтверждённое событие
+            add_event(chat.id, "artifact_printer_verified", raw_clean, author_of(update))
+        else:
+            await msg.reply_text("📸 Фото принтера — есть замечания:\n" + "\n".join(issues))
+
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.exception("Vision-проверка принтера упала")
+        # Не флудим в чат, просто ставим реакцию что фото получили
+        await react_clean(context, chat.id, msg.message_id)
 
 
 async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -681,49 +762,85 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Запоминаем место
     location, topic_type = recognize_place(update)
 
-    add_event(chat.id, "location", None, author_of(update))
-    logger.info(f"Геолокация в чате {chat.id} от {author_of(update)}")
+    # live_period в секундах: 0 / None = обычная точка; ≥900 = онлайн от 15 мин
+    live_period = getattr(msg.location, "live_period", None) or 0
+    is_online_15min = live_period >= 900
+
+    add_event(chat.id, "location", f"live_period={live_period}", author_of(update))
+    logger.info(f"Геолокация в чате {chat.id} от {author_of(update)} live={live_period}")
 
     # В Instructions & Reminders — молчим дальше
     if topic_type == "instructions":
         return
 
-    # Анализ времени геолокации против начала смены
-    if location:
-        shift_start = SHIFT_START_HOURS.get(location)
-        if shift_start is not None:
-            # Dubai UTC+4 — переводим текущее UTC в локальное
-            now_utc = dt.datetime.now(dt.timezone.utc)
-            now_dubai = now_utc + dt.timedelta(hours=4)
-            now_h, now_m = now_dubai.hour, now_dubai.minute
+    # Если это не онлайн ≥15 мин — просим переслать правильно
+    if not is_online_15min:
+        try:
+            await msg.reply_text(
+                "Нужна онлайн геолокация от 15 минут, не точка."
+            )
+        except Exception:
+            logger.exception("Не смог попросить онлайн геолокацию")
+        return
 
-            on_time = (now_h < shift_start) or (now_h == shift_start and now_m == 0)
+    # Это онлайн ≥15 мин — теперь смотрим вовремя ли
+    if not location:
+        # Точку не распознали, но онлайн принимаем — просто лайк
+        await react_clean(context, chat.id, msg.message_id)
+        return
 
-            if on_time:
-                # Лайк за пунктуальность
-                try:
-                    await context.bot.set_message_reaction(
-                        chat_id=chat.id,
-                        message_id=msg.message_id,
-                        reaction="👍",
-                    )
-                except Exception:
-                    logger.exception("Не смог поставить реакцию на геолокацию")
-            else:
-                # Опоздание — фиксируем и считаем
-                user = update.effective_user
-                username = (user.username if user else None) or f"id{user.id if user else 0}"
-                count = record_lateness(username, location)
-                minutes_late = (now_h - shift_start) * 60 + now_m
-                await handle_lateness(msg, username, count, minutes_late, location)
+    shift_start = SHIFT_START_HOURS.get(location)
+    if shift_start is None:
+        await react_clean(context, chat.id, msg.message_id)
+        return
+
+    # Dubai UTC+4
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    now_dubai = now_utc + dt.timedelta(hours=4)
+    now_h, now_m = now_dubai.hour, now_dubai.minute
+
+    # Считаем сколько минут после старта смены
+    minutes_after_start = (now_h - shift_start) * 60 + now_m
+
+    # Допуск 5 минут
+    LATENESS_GRACE = 5
+
+    if minutes_after_start <= LATENESS_GRACE:
+        # Вовремя (включая допуск 5 минут) → лайк
+        await react_clean(context, chat.id, msg.message_id)
+        return
+
+    # Опоздание
+    user = update.effective_user
+    username = (user.username if user else None) or f"id{user.id if user else 0}"
+    real_name = resolve_employee_name(username) or username
+    count = record_lateness(username, location, minutes_after_start)
+    await handle_lateness(msg, real_name, count, minutes_after_start, location, context)
+
+
+# Разрешённые реакции на чистые сообщения (Марса выбирает любую)
+ALLOWED_CLEAN_REACTIONS = ["👍", "❤️", "✅", "✔️", "☑️"]
+
+
+async def react_clean(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
+    """Ставит реакцию из разрешённого набора. Если не получилось — молчит."""
+    reaction = random.choice(ALLOWED_CLEAN_REACTIONS)
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=reaction,
+        )
+    except Exception:
+        logger.exception(f"Не смог поставить реакцию {reaction}")
 
 
 LATENESS_FILE = Path("lateness.json")
 
 
-def record_lateness(username: str, location: str) -> int:
-    """Записывает опоздание сотрудника в текущем месяце.
-    Возвращает счётчик опозданий за этот месяц."""
+def record_lateness(username: str, location: str, minutes_late: int) -> int:
+    """Записывает опоздание сотрудника. Счётчик за ТЕКУЩУЮ календарную НЕДЕЛЮ.
+    Возвращает счётчик опозданий за эту неделю."""
     try:
         data = {}
         if LATENESS_FILE.exists():
@@ -732,15 +849,17 @@ def record_lateness(username: str, location: str) -> int:
             except Exception:
                 data = {}
 
-        # Ключ — username + год-месяц (счётчик обнуляется каждый месяц)
-        ym = dt.date.today().strftime("%Y-%m")
-        key = f"{username}::{ym}"
+        # Ключ по году+номеру недели (ISO) — обнуляется каждую неделю
+        today = dt.date.today()
+        year, week, _ = today.isocalendar()
+        key = f"{username}::{year}-W{week:02d}"
 
         entry = data.get(key, {"count": 0, "incidents": []})
         entry["count"] += 1
         entry["incidents"].append({
             "time": dt.datetime.now(dt.timezone.utc).isoformat(),
             "location": location,
+            "minutes_late": minutes_late,
         })
         data[key] = entry
 
@@ -751,42 +870,178 @@ def record_lateness(username: str, location: str) -> int:
         return 0
 
 
-async def handle_lateness(msg, username: str, count: int, minutes_late: int, location: str) -> None:
-    """Реагирует на опоздание в зависимости от того какое оно по счёту."""
+async def handle_lateness(msg, real_name: str, count: int, minutes_late: int, location: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Реагирует на опоздание по новой логике:
+    - до +5 мин   → норма, эта функция не вызывается
+    - +6..15 мин  → 1-й: мягко / 2-й: «я слежу» / 3-й за неделю: штраф 50 + GM
+    - +15+ мин    → жёстко с первого раза + GM с первого раза"""
+    HARD_THRESHOLD = 15
+
+    if minutes_late > HARD_THRESHOLD:
+        # Жёстко с первого раза
+        text = (
+            f"⏰ {real_name}, опоздание {minutes_late} минут от начала смены — "
+            f"это много. Штраф 50 AED, инцидент уйдёт GM."
+        )
+        await _send_safe(msg, text)
+        await send_to_gm(
+            context,
+            f"⚠️ Жёсткое опоздание\n"
+            f"Сотрудник: {real_name}\n"
+            f"Точка: {location}\n"
+            f"Опоздание: {minutes_late} мин (порог жёсткой зоны: >{HARD_THRESHOLD} мин)\n"
+            f"Штраф: 50 AED",
+        )
+        return
+
+    # Зона +6..15 минут — мягкая эскалация
     if count == 1:
         text = (
-            f"⏰ Геолокация пришла на {minutes_late} минут позже начала смены.\n"
-            f"Это первое опоздание в этом месяце — не критично, но в следующий раз постарайся приходить вовремя."
+            f"⏰ {real_name}, ты опоздала(а) на {minutes_late} минут от начала смены. "
+            f"В этот раз — мягко, но постарайся приходить вовремя."
         )
     elif count == 2:
         text = (
-            f"⏰ Геолокация пришла на {minutes_late} минут позже начала смены.\n"
-            f"Это уже второе опоздание в этом месяце. Следующее будет со штрафом."
+            f"⏰ {real_name}, снова опоздание ({minutes_late} мин). "
+            f"Это уже второй раз за неделю — я слежу за тобой."
         )
     else:
+        # 3+ за неделю — штраф + GM
         text = (
-            f"⏰ Геолокация пришла на {minutes_late} минут позже начала смены.\n"
-            f"Это {count}-е опоздание в этом месяце — штраф 50 AED."
+            f"⏰ {real_name}, опоздание {minutes_late} мин. "
+            f"Это {count}-й раз за неделю — штраф 50 AED."
+        )
+        await send_to_gm(
+            context,
+            f"⚠️ Опоздание (3+ за неделю)\n"
+            f"Сотрудник: {real_name}\n"
+            f"Точка: {location}\n"
+            f"Опоздание: {minutes_late} мин\n"
+            f"Случай №{count} за эту неделю\n"
+            f"Штраф: 50 AED",
         )
 
+    await _send_safe(msg, text)
+
+
+async def _send_safe(msg, text: str) -> None:
     try:
         await msg.reply_text(text)
     except Exception:
-        logger.exception("Не смог отправить уведомление об опоздании")
+        logger.exception("Не смог отправить уведомление")
 
 
 def is_shift_report_open(text: str | None) -> bool:
-    """Распознаёт Shift Report (открытие смены) по характерным маркерам."""
+    """Распознаёт Shift Report (открытие смены)."""
     if not text:
         return False
     t = text.lower()
-    # Должны быть и shift report маркер, и упоминание оборудования
-    has_header = "shift report" in t
-    has_equipment = any(kw in t for kw in [
-        "equipment list", "macbook", "canon", "epson", "godox", "sigma",
-        "team on shift", "equipment status",
-    ])
-    return has_header and has_equipment
+    return "shift report" in t
+
+
+# Эталоны принтеров по точкам
+PRINTER_COUNT_BY_LOCATION = {
+    "Avenue":   2,
+    "O Lounge": 3,
+    "Chayka":   3,
+    "Molodost": 2,
+    "Del Mar":  2,
+    "TEST":     2,  # для теста
+}
+
+# Дни недели когда точка НЕ работает (0=пн, 1=вт, ..., 6=вс)
+LOCATION_DAYS_OFF = {
+    "Chayka":   [0, 1],  # пн, вт
+    "Molodost": [0, 1],
+    "Del Mar":  [0, 1],
+}
+
+
+def parse_shift_report_date(text: str) -> dt.date | None:
+    """Парсит дату в формате Д.М.Г или Д/М/Г (НЕ американский)."""
+    # ищем дату ДД.ММ.ГГГГ или ДД/ММ/ГГГГ
+    m = re.search(r"\b(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})\b", text)
+    if not m:
+        return None
+    try:
+        day = int(m.group(1))
+        month = int(m.group(2))
+        year = int(m.group(3))
+        return dt.date(year, month, day)
+    except (ValueError, TypeError):
+        return None
+
+
+def check_shift_report_structure(text: str, location: str | None) -> str | None:
+    """Проверяет Shift Report по новому шаблону.
+    Возвращает None если всё ок (тогда ставится реакция),
+    или текст с проблемами если есть ошибки."""
+    issues = []
+
+    # 1) Дата
+    date_in_report = parse_shift_report_date(text)
+    today = smart_shift_date()
+    if not date_in_report:
+        issues.append("• Не вижу дату (формат Д.М.Г или Д/М/Г)")
+    elif date_in_report != today:
+        issues.append(
+            f"• Дата в отчёте {date_in_report.strftime('%d.%m.%Y')} "
+            f"не совпадает с сегодняшней сменой ({today.strftime('%d.%m.%Y')})"
+        )
+
+    # 2) Team
+    if not re.search(r"team\s*:", text, re.IGNORECASE):
+        issues.append("• Не вижу строку «Team:» с именами")
+
+    # 3) Три фото-метки
+    photo_lines = re.findall(r"photo\s*\d", text, re.IGNORECASE)
+    if len(photo_lines) < 3:
+        issues.append(f"• Нашёл только {len(photo_lines)} строк «Photo N» (нужно 3)")
+
+    # 4) Stock at start of shift
+    if not re.search(r"stock\s*at\s*start", text, re.IGNORECASE):
+        issues.append("• Не вижу блок «Stock at start of shift»")
+    else:
+        # Проверяем что есть конкретные позиции с цифрами
+        required = ["a4 paper", "envelopes", "bags", "frames", "business cards", "bc envelopes"]
+        missing = []
+        for label in required:
+            if not re.search(rf"{label}\s*:\s*\d+", text, re.IGNORECASE):
+                missing.append(label.title())
+        if missing:
+            issues.append(f"• В Stock не заполнены: {', '.join(missing)}")
+
+    # 5) Issues
+    issues_match = re.search(r"issues\s*:\s*(.+?)(?:\n\n|\Z)", text, re.IGNORECASE | re.DOTALL)
+    if issues_match:
+        issues_text = issues_match.group(1).strip().lower()
+        # Если "none" / "нет" / "нет проблем" — всё ок. Иначе — тревога
+        if issues_text not in ("none", "нет", "no", "нет проблем", "—", "-"):
+            issues.append(f"⚠️ Есть отклонения в смене — сообщи GM: «{issues_match.group(1).strip()}»")
+
+    # 6) День недели — точка работает?
+    if location and location in LOCATION_DAYS_OFF:
+        weekday = today.weekday()
+        if weekday in LOCATION_DAYS_OFF[location]:
+            day_names = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
+            issues.append(
+                f"• {location} обычно не работает в {day_names[weekday]}. "
+                f"Уточни у GM, действительно ли сегодня смена."
+            )
+
+    # 7) Низкие остатки рамок
+    frames_m = re.search(r"frames\s*:\s*(\d+)", text, re.IGNORECASE)
+    if frames_m:
+        frames_count = int(frames_m.group(1))
+        if frames_count < 15:
+            issues.append(f"• Рамок осталось мало: {frames_count} шт. Подвози скорее.")
+
+    if not issues:
+        return None
+
+    lines = ["⚠️ Shift Report — проверь:"]
+    lines.extend(issues)
+    return "\n".join(lines)
 
 
 def is_printer_photo(caption: str | None) -> bool:
@@ -866,17 +1121,18 @@ def detect_shift_close_artifact(caption: str | None) -> str | None:
 
 
 async def check_shift_opening_deadline(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Проверяет, что в Shifts-теме до дедлайна были все элементы открытия:
-    - геолокация
-    - Shift Report (текст со списком оборудования)
-    - фото уровня чернил принтеров
-    Если что-то отсутствует — пишет в чат список пропущенных пунктов."""
+    """Проверяет открытие смены: геолокация + Shift Report + фото принтера."""
     job = context.job
     chat_id = job.data["chat_id"]
     location = job.data["location"]
     thread_id = job.data.get("thread_id")
 
-    # Смотрим события за последние ~4 часа
+    # Если точка не работает в этот день — пропускаем проверку
+    today = dt.date.today()
+    if location in LOCATION_DAYS_OFF and today.weekday() in LOCATION_DAYS_OFF[location]:
+        logger.info(f"{location} не работает {today.strftime('%A')}, проверка пропущена")
+        return
+
     events = load_events().get(str(chat_id), [])
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
 
@@ -894,14 +1150,14 @@ async def check_shift_opening_deadline(context: ContextTypes.DEFAULT_TYPE) -> No
             has_location = True
         if e.get("type") == "shift_report_open":
             has_shift_report = True
-        if e.get("type") == "photo" and is_printer_photo(e.get("caption")):
+        if e.get("type") in ("artifact_printer", "artifact_printer_verified"):
             has_printer_photo = True
 
     missing = []
     if not has_location:
-        missing.append("• геолокацию")
+        missing.append("• онлайн геолокацию (от 15 минут)")
     if not has_shift_report:
-        missing.append("• Shift Report со списком оборудования")
+        missing.append("• Shift Report")
     if not has_printer_photo:
         missing.append("• фото уровня чернил принтеров")
 
@@ -917,6 +1173,11 @@ async def check_shift_opening_deadline(context: ContextTypes.DEFAULT_TYPE) -> No
             text=text,
         )
         logger.info(f"Напоминание об открытии смены в чат {chat_id} ({location}): {missing}")
+        # И в GM
+        await send_to_gm(
+            context,
+            f"⚠️ Открытие смены {location} не закрыто к дедлайну:\n" + "\n".join(missing),
+        )
     except Exception:
         logger.exception(f"Не смог отправить напоминание в {chat_id}")
 
@@ -2495,632 +2756,6 @@ async def cmd_close_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 
-# ──────────────────────────────────────────────
-# КОМАНДА /sale — ввод одной продажи через inline-кнопки
-# Бот редактирует ОДНО сообщение в чате, без флуда
-# ──────────────────────────────────────────────
-
-SALES_STATS_FILE = Path("sales_stats.json")
-
-
-def make_blank_sale(user, chat, msg, location: str | None) -> dict:
-    return {
-        "user_id": user.id,
-        "chat_id": chat.id,
-        "thread_id": msg.message_thread_id if msg.is_topic_message else None,
-        "location": location,
-        "date": smart_shift_date().isoformat(),
-        "frames": 0,
-        "wf": 0,
-        "bags": 0,
-        "envelopes": 0,
-        "digital": False,
-        "phone": None,
-        "guest": None,
-        "business_card": True,  # по умолчанию ДА — почти всегда даём
-        "amount": 0,
-        "payment": "card",  # card | cash | mixed
-        "card": 0,
-        "cash": 0,
-        "comment": None,
-        "stage": "items",  # items | digital_q | phone | name | bc_q | amount | payment | comment | confirm
-        "msg_id": None,
-        "number": None,  # порядковый номер в Sales Breakdown за день
-    }
-
-
-def format_sale_preview(sale: dict) -> str:
-    """Текст текущего состояния продажи для отображения с кнопками."""
-    parts = []
-    parts.append("📸 *Новая продажа*\n")
-
-    # Состав
-    items_line = (
-        f"🖼 Frame: *{sale['frames']}*  "
-        f"📄 w/f: *{sale['wf']}*\n"
-        f"🛍 Bag: *{sale['bags']}*  "
-        f"✉️ Envelope: *{sale['envelopes']}*"
-    )
-    parts.append(items_line)
-
-    # Электронка / телефон
-    if sale["digital"]:
-        phone = sale.get("phone") or "не указан"
-        parts.append(f"💾 Digital: *Да*   📞 {phone}")
-    else:
-        parts.append(f"💾 Digital: *Нет*")
-
-    # Гость
-    parts.append(f"👤 Гость: *{sale.get('guest') or '—'}*")
-
-    # Визитка
-    bc = "✅" if sale["business_card"] else "❌"
-    parts.append(f"📇 Business Card: {bc}")
-
-    # Сумма + оплата
-    if sale["amount"]:
-        if sale["payment"] == "card":
-            parts.append(f"💰 *{sale['amount']} AED* — Card 💳")
-        elif sale["payment"] == "cash":
-            parts.append(f"💰 *{sale['amount']} AED* — Cash 💵")
-        else:
-            parts.append(
-                f"💰 *{sale['amount']} AED* — Card {sale['card']} 💳 + Cash {sale['cash']} 💵"
-            )
-    else:
-        parts.append("💰 Сумма: —")
-
-    if sale.get("comment"):
-        parts.append(f"💬 {sale['comment']}")
-
-    return "\n".join(parts)
-
-
-def items_keyboard(sale: dict) -> InlineKeyboardMarkup:
-    """Кнопки на шаге 'items': регулируем количество frames/wf/bags/envelopes."""
-    rows = [
-        [
-            InlineKeyboardButton("🖼 Frame −", callback_data="sale:dec:frames"),
-            InlineKeyboardButton(f"{sale['frames']}", callback_data="sale:noop"),
-            InlineKeyboardButton("+", callback_data="sale:inc:frames"),
-        ],
-        [
-            InlineKeyboardButton("📄 w/f −", callback_data="sale:dec:wf"),
-            InlineKeyboardButton(f"{sale['wf']}", callback_data="sale:noop"),
-            InlineKeyboardButton("+", callback_data="sale:inc:wf"),
-        ],
-        [
-            InlineKeyboardButton("🛍 Bag −", callback_data="sale:dec:bags"),
-            InlineKeyboardButton(f"{sale['bags']}", callback_data="sale:noop"),
-            InlineKeyboardButton("+", callback_data="sale:inc:bags"),
-        ],
-        [
-            InlineKeyboardButton("✉️ Env −", callback_data="sale:dec:envelopes"),
-            InlineKeyboardButton(f"{sale['envelopes']}", callback_data="sale:noop"),
-            InlineKeyboardButton("+", callback_data="sale:inc:envelopes"),
-        ],
-        [InlineKeyboardButton("▶️ Дальше", callback_data="sale:next:digital_q")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-def digital_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💾 Digital: Да", callback_data="sale:digital:1"),
-            InlineKeyboardButton("Нет", callback_data="sale:digital:0"),
-        ],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:items")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
-    ])
-
-
-def bc_keyboard(sale: dict) -> InlineKeyboardMarkup:
-    bc = sale["business_card"]
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(("✅ " if bc else "") + "Да", callback_data="sale:bc:1"),
-            InlineKeyboardButton(("✅ " if not bc else "") + "Нет", callback_data="sale:bc:0"),
-        ],
-        [InlineKeyboardButton("▶️ Дальше", callback_data="sale:next:amount")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:name")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
-    ])
-
-
-def payment_keyboard(sale: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💳 Card", callback_data="sale:pay:card"),
-            InlineKeyboardButton("💵 Cash", callback_data="sale:pay:cash"),
-        ],
-        [InlineKeyboardButton("Микс (введу руками)", callback_data="sale:pay:mixed")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:amount")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
-    ])
-
-
-def confirm_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Опубликовать", callback_data="sale:publish")],
-        [InlineKeyboardButton("💬 Добавить комментарий", callback_data="sale:add_comment")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="sale:back:payment")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")],
-    ])
-
-
-def stage_prompt(sale: dict) -> str:
-    """Текст вопроса для текущего этапа, добавляется к превью."""
-    stage = sale["stage"]
-    if stage == "items":
-        return "\n\nНастрой количество и жми *Дальше*"
-    if stage == "digital_q":
-        return "\n\n💾 Электронка нужна?"
-    if stage == "phone":
-        return "\n\n📞 Пришли номер гостя (например +971...)"
-    if stage == "name":
-        return "\n\n👤 Имя гостя или название папки?"
-    if stage == "bc_q":
-        return "\n\n📇 Визитка вложена?"
-    if stage == "amount":
-        return "\n\n💰 Сумма продажи в AED? Просто число"
-    if stage == "payment":
-        return "\n\nКак оплачено?"
-    if stage == "payment_mixed":
-        return f"\n\nПришли `card X cash Y` (сумма = {sale['amount']})"
-    if stage == "comment_input":
-        return "\n\n💬 Пришли комментарий одной строкой"
-    if stage == "confirm":
-        line = build_sale_line_preview(sale)
-        return f"\n\n📋 Финальная строка:\n`{line}`"
-    return ""
-
-
-def build_sale_line_preview(sale: dict) -> str:
-    """Строка как будет в чате (без номера — он добавится при публикации)."""
-    if sale["payment"] == "card":
-        icon = "💳"
-    elif sale["payment"] == "cash":
-        icon = "💵"
-    else:
-        icon = "💳💵"
-
-    parts = []
-    if sale["frames"]:
-        parts.append(f"{sale['frames']} Frame")
-    if sale["wf"]:
-        parts.append(f"{sale['wf']} w/f")
-    if sale["bags"]:
-        parts.append(f"{sale['bags']} Bag")
-    if sale["envelopes"]:
-        parts.append(f"{sale['envelopes']} Envelope")
-    if sale.get("digital"):
-        d = sale["frames"] + sale["wf"]
-        if d > 0:
-            parts.append(f"{d} Digital")
-    if sale["business_card"]:
-        parts.append("1 Business Card with Envelope")
-    items_str = ", ".join(parts) if parts else "—"
-
-    if sale.get("phone"):
-        contact = sale["phone"]
-    elif not sale.get("digital"):
-        contact = "No Need Digital"
-    else:
-        contact = ""
-
-    guest = sale.get("guest") or ""
-
-    line = f"{sale['amount']} AED {icon} — {items_str}"
-    if contact:
-        line += f" — {contact}"
-    if guest:
-        line += f" — {guest}"
-    if sale.get("comment"):
-        line += f"  // {sale['comment']}"
-    return line
-
-
-def next_sale_number_for_day(chat_id: int, date_iso: str) -> int:
-    """Возвращает следующий порядковый номер продажи за смену."""
-    try:
-        if not SALES_STATS_FILE.exists():
-            return 1
-        data = json.loads(SALES_STATS_FILE.read_text(encoding="utf-8"))
-        sales = data.get("sales", [])
-        count = sum(1 for s in sales if s.get("chat_id") == chat_id and s.get("date") == date_iso)
-        return count + 1
-    except Exception:
-        return 1
-
-
-def save_sale_to_stats(sale: dict, number: int) -> None:
-    try:
-        data = {}
-        if SALES_STATS_FILE.exists():
-            try:
-                data = json.loads(SALES_STATS_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        entry = {
-            "time": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "date": sale.get("date"),
-            "chat_id": sale.get("chat_id"),
-            "thread_id": sale.get("thread_id"),
-            "location": sale.get("location"),
-            "number": number,
-            "frames": sale.get("frames", 0),
-            "wf": sale.get("wf", 0),
-            "bags": sale.get("bags", 0),
-            "envelopes": sale.get("envelopes", 0),
-            "digital": sale.get("digital", False),
-            "business_card": sale.get("business_card", False),
-            "amount": sale.get("amount", 0),
-            "card": sale.get("card", 0),
-            "cash": sale.get("cash", 0),
-            "phone": sale.get("phone"),
-            "guest": sale.get("guest"),
-            "comment": sale.get("comment"),
-        }
-        sales_list = data.get("sales", [])
-        sales_list.append(entry)
-        data["sales"] = sales_list[-5000:]
-        SALES_STATS_FILE.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception:
-        logger.exception("Не смог сохранить sales_stats")
-
-
-def keyboard_for_stage(sale: dict) -> InlineKeyboardMarkup | None:
-    stage = sale["stage"]
-    if stage == "items":
-        return items_keyboard(sale)
-    if stage == "digital_q":
-        return digital_keyboard()
-    if stage == "bc_q":
-        return bc_keyboard(sale)
-    if stage == "payment":
-        return payment_keyboard(sale)
-    if stage == "confirm":
-        return confirm_keyboard()
-    # Этапы с текстовым вводом — без клавиатуры,
-    # но с кнопкой "отмена"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Отмена", callback_data="sale:cancel")]
-    ])
-
-
-async def render_sale(sale: dict, query=None, message=None, context=None) -> None:
-    """Перерисовывает сообщение бота по текущему состоянию sale."""
-    text = format_sale_preview(sale) + stage_prompt(sale)
-    keyboard = keyboard_for_stage(sale)
-    try:
-        if query is not None:
-            await query.edit_message_text(
-                text, reply_markup=keyboard, parse_mode="Markdown"
-            )
-        elif message is not None and context is not None:
-            sent = await message.reply_text(
-                text, reply_markup=keyboard, parse_mode="Markdown"
-            )
-            sale["msg_id"] = sent.message_id
-    except Exception:
-        logger.exception("Не смог отрисовать sale")
-
-
-async def cmd_sale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-    if not chat or not user or not msg:
-        return
-
-    emp = get_employee_info(user.username)
-    if not emp:
-        if user:
-            log_unauthorized_access(user)
-        await msg.reply_text("У тебя нет доступа. Обратись к Сабине.")
-        return
-
-    location, _ = recognize_place(update)
-    sale = make_blank_sale(user, chat, msg, location)
-
-    # Удаляем команду /sale из чата чтобы не оставлять следов
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    # Сохраняем в bot_data по ключу message_id (после отправки)
-    # А пока — во временное хранилище по user_id
-    if "active_sales" not in context.bot_data:
-        context.bot_data["active_sales"] = {}
-
-    text = format_sale_preview(sale) + stage_prompt(sale)
-    keyboard = keyboard_for_stage(sale)
-    try:
-        sent = await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=sale["thread_id"],
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="Markdown",
-        )
-        sale["msg_id"] = sent.message_id
-        # Привязываем sale к message_id
-        context.bot_data["active_sales"][sent.message_id] = sale
-    except Exception:
-        logger.exception("Не смог запустить /sale")
-        await context.bot.send_message(
-            chat_id=chat.id,
-            message_thread_id=sale["thread_id"],
-            text="Не получилось запустить ввод продажи.",
-        )
-
-
-async def on_sale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка нажатий на кнопки /sale."""
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    await query.answer()
-
-    if not query.data.startswith("sale:"):
-        return
-
-    msg = query.message
-    if not msg:
-        return
-
-    sale = context.bot_data.get("active_sales", {}).get(msg.message_id)
-    if not sale:
-        try:
-            await query.edit_message_text("Эта продажа устарела. Запусти /sale заново.")
-        except Exception:
-            pass
-        return
-
-    # Проверка: тот же юзер
-    if query.from_user and query.from_user.id != sale["user_id"]:
-        return  # тихо игнорируем
-
-    parts = query.data.split(":")
-    action = parts[1] if len(parts) > 1 else ""
-
-    if action == "noop":
-        return
-
-    if action == "cancel":
-        context.bot_data["active_sales"].pop(msg.message_id, None)
-        try:
-            await query.edit_message_text("Продажа отменена.")
-        except Exception:
-            pass
-        # Удалить через 5 сек
-        return
-
-    if action == "inc":
-        key = parts[2]
-        sale[key] = min(99, sale.get(key, 0) + 1)
-        await render_sale(sale, query=query)
-        return
-
-    if action == "dec":
-        key = parts[2]
-        sale[key] = max(0, sale.get(key, 0) - 1)
-        await render_sale(sale, query=query)
-        return
-
-    if action == "next":
-        target = parts[2]
-        # Проверки переходов
-        if target == "digital_q":
-            if sale["frames"] + sale["wf"] == 0:
-                # Должен быть хотя бы один кадр
-                await query.answer("Нужно хотя бы 1 фото", show_alert=True)
-                return
-            sale["stage"] = "digital_q"
-        elif target == "amount":
-            sale["stage"] = "amount"
-        await render_sale(sale, query=query)
-        return
-
-    if action == "back":
-        target = parts[2]
-        sale["stage"] = target
-        await render_sale(sale, query=query)
-        return
-
-    if action == "digital":
-        sale["digital"] = (parts[2] == "1")
-        if sale["digital"]:
-            sale["stage"] = "phone"
-        else:
-            sale["phone"] = None
-            sale["stage"] = "name"
-        await render_sale(sale, query=query)
-        return
-
-    if action == "bc":
-        sale["business_card"] = (parts[2] == "1")
-        sale["stage"] = "amount"
-        await render_sale(sale, query=query)
-        return
-
-    if action == "pay":
-        choice = parts[2]
-        if choice == "card":
-            sale["payment"] = "card"
-            sale["card"] = sale["amount"]
-            sale["cash"] = 0
-            sale["stage"] = "confirm"
-        elif choice == "cash":
-            sale["payment"] = "cash"
-            sale["cash"] = sale["amount"]
-            sale["card"] = 0
-            sale["stage"] = "confirm"
-        elif choice == "mixed":
-            sale["payment"] = "mixed"
-            sale["stage"] = "payment_mixed"
-        await render_sale(sale, query=query)
-        return
-
-    if action == "add_comment":
-        sale["stage"] = "comment_input"
-        await render_sale(sale, query=query)
-        return
-
-    if action == "publish":
-        await publish_sale(sale, query, context)
-        return
-
-
-async def on_sale_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Текстовый ввод на этапах phone/name/amount/payment_mixed/comment_input.
-    Возвращает True если обработал (чтобы on_text не дублировал)."""
-    msg = update.effective_message
-    user = update.effective_user
-    if not msg or not user or not msg.text:
-        return False
-
-    # Ищем активную продажу этого юзера в этом чате
-    active = context.bot_data.get("active_sales", {})
-    sale = None
-    for s in active.values():
-        if s["user_id"] == user.id and s["chat_id"] == update.effective_chat.id:
-            sale = s
-            break
-    if not sale:
-        return False
-
-    stage = sale["stage"]
-    text = msg.text.strip()
-
-    handled = False
-
-    if stage == "phone":
-        if not re.match(r"^\+?\d[\d\s\-]{6,}$", text):
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            return True
-        sale["phone"] = "+" + re.sub(r"\D", "", text).lstrip("+")
-        sale["stage"] = "name"
-        handled = True
-
-    elif stage == "name":
-        sale["guest"] = text
-        sale["stage"] = "bc_q"
-        handled = True
-
-    elif stage == "amount":
-        try:
-            amount = int(re.sub(r"\D", "", text))
-            if amount <= 0:
-                return True
-            sale["amount"] = amount
-            sale["stage"] = "payment"
-            handled = True
-        except ValueError:
-            return True
-
-    elif stage == "payment_mixed":
-        card = 0
-        cash = 0
-        m = re.search(r"card\s+(\d+)", text.lower())
-        if m:
-            card = int(m.group(1))
-        m = re.search(r"cash\s+(\d+)", text.lower())
-        if m:
-            cash = int(m.group(1))
-        if card == 0 and cash == 0:
-            return True
-        if card + cash != sale["amount"]:
-            return True
-        sale["card"] = card
-        sale["cash"] = cash
-        sale["stage"] = "confirm"
-        handled = True
-
-    elif stage == "comment_input":
-        sale["comment"] = text
-        sale["stage"] = "confirm"
-        handled = True
-
-    if not handled:
-        return False
-
-    # Удаляем сообщение юзера и перерисовываем сообщение бота
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    try:
-        await context.bot.edit_message_text(
-            chat_id=sale["chat_id"],
-            message_id=sale["msg_id"],
-            text=format_sale_preview(sale) + stage_prompt(sale),
-            reply_markup=keyboard_for_stage(sale),
-            parse_mode="Markdown",
-        )
-    except Exception:
-        logger.exception("Не смог перерисовать sale после текста")
-
-    return True
-
-
-async def publish_sale(sale: dict, query, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Финальная публикация продажи в чат и сохранение в статистику."""
-    # Получаем порядковый номер
-    number = next_sale_number_for_day(sale["chat_id"], sale["date"])
-
-    line_body = build_sale_line_preview(sale)
-    final_line = f"{number}. {line_body}"
-
-    # Удаляем диалоговое сообщение
-    try:
-        await context.bot.delete_message(
-            chat_id=sale["chat_id"], message_id=sale["msg_id"]
-        )
-    except Exception:
-        pass
-
-    # Постим финальную строку
-    try:
-        await context.bot.send_message(
-            chat_id=sale["chat_id"],
-            message_thread_id=sale["thread_id"],
-            text=final_line,
-        )
-    except Exception:
-        logger.exception("Не смог опубликовать продажу")
-
-    # Сохраняем
-    save_sale_to_stats(sale, number)
-
-    # Чистим активную продажу
-    context.bot_data.get("active_sales", {}).pop(sale.get("msg_id"), None)
-
-
-
-    """True если сообщение — reply на бот-сообщение с вердиктом/ошибками отчёта,
-    а не на текущий вопрос диалога."""
-    msg = update.effective_message
-    if not msg or not msg.reply_to_message:
-        return False
-    if not msg.reply_to_message.from_user:
-        return False
-    if msg.reply_to_message.from_user.id != context.bot.id:
-        return False
-    replied_text = msg.reply_to_message.text or ""
-    markers = ["Нашёл проблем", "Found", "Отчёт чистый", "Сегодня ", "Касса ", "Проверь", "Sales Breakdown"]
-    return any(m in replied_text for m in markers)
-
-
 def is_reply_to_verdict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """True если сообщение — reply на бот-сообщение с вердиктом/ошибками отчёта."""
     msg = update.effective_message
@@ -3145,6 +2780,88 @@ async def maybe_handle_verdict_reply(update: Update, context: ContextTypes.DEFAU
         return False
     await handle_explanation_reply(update, context)
     return True
+
+
+# ──────────────────────────────────────────────
+# GM-ЧАТ — куда слать зарплаты и штрафы
+# ──────────────────────────────────────────────
+
+GM_CHAT_FILE = Path("gm_chat.json")
+
+
+def get_gm_chat() -> dict | None:
+    """Возвращает {chat_id, thread_id} или None."""
+    if not GM_CHAT_FILE.exists():
+        return None
+    try:
+        return json.loads(GM_CHAT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def set_gm_chat(chat_id: int, thread_id: int | None) -> None:
+    GM_CHAT_FILE.write_text(
+        json.dumps({"chat_id": chat_id, "thread_id": thread_id}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+async def send_to_gm(context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Отправить сообщение в GM-чат. Возвращает True если успех."""
+    gm = get_gm_chat()
+    if not gm:
+        logger.warning("GM-чат не настроен (нет gm_chat.json). Сообщение НЕ отправлено: %s", text[:100])
+        return False
+    try:
+        await context.bot.send_message(
+            chat_id=gm["chat_id"],
+            message_thread_id=gm.get("thread_id"),
+            text=text,
+        )
+        return True
+    except Exception:
+        logger.exception("Не смог отправить в GM-чат")
+        return False
+
+
+async def cmd_setgm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Назначить текущий чат как GM-чат. Только Sabina."""
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return
+
+    emp = get_employee_info(user.username)
+    if not emp or emp.get("role") != "gm":
+        await msg.reply_text("Только GM может назначить этот чат как GM-чат.")
+        return
+
+    thread_id = msg.message_thread_id if msg.is_topic_message else None
+    set_gm_chat(chat.id, thread_id)
+    await msg.reply_text(
+        f"✅ Этот чат назначен как GM-чат.\n"
+        f"Сюда буду слать зарплаты, штрафы за опоздания, тревоги и утреннюю сводку.\n\n"
+        f"chat_id: `{chat.id}`\n"
+        f"thread_id: `{thread_id}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Возвращает user_id и chat_id — для отладки."""
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return
+    thread_id = msg.message_thread_id if msg.is_topic_message else None
+    await msg.reply_text(
+        f"👤 user_id: `{user.id}`\n"
+        f"📍 chat_id: `{chat.id}`\n"
+        f"🧵 thread_id: `{thread_id}`",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3232,6 +2949,14 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_chat=False,  # стейт привязан к user_id, не к чату
     )
+    # Команды без диалогов регистрируем ПЕРВЫМИ — group=-1
+    # чтобы они работали поверх любых активных ConversationHandler'ов
+    app.add_handler(CommandHandler("start", cmd_start), group=-1)
+    app.add_handler(CommandHandler("setgm", cmd_setgm), group=-1)
+    app.add_handler(CommandHandler("myid", cmd_myid), group=-1)
+    app.add_handler(CommandHandler("whereami", cmd_whereami), group=-1)
+    app.add_handler(CommandHandler("locations", cmd_locations), group=-1)
+
     app.add_handler(report_conv)
 
     # Диалог /close — в Cash Report групповых чатов
@@ -3266,13 +2991,6 @@ def main() -> None:
     )
     app.add_handler(close_conv)
 
-    # Команда /sale — на inline-кнопках (CallbackQueryHandler)
-    app.add_handler(CommandHandler("sale", cmd_sale))
-    app.add_handler(CallbackQueryHandler(on_sale_callback, pattern=r"^sale:"))
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("whereami", cmd_whereami))
-    app.add_handler(CommandHandler("locations", cmd_locations))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
